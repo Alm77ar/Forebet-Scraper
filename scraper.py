@@ -26,7 +26,7 @@ def get_flaresolverr_clearance(url):
     }
     headers = {"Content-Type": "application/json"}
 
-    print(f"Obtaining Cloudflare clearance via FlareSolverr for: {url}")
+    print(f"Requesting Cloudflare session via FlareSolverr: {url}")
     response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
     response.raise_for_status()
 
@@ -35,7 +35,7 @@ def get_flaresolverr_clearance(url):
         solution = data["solution"]
         return solution.get("cookies", []), solution.get("userAgent", "")
 
-    raise RuntimeError(f"FlareSolverr clearance failed: {data.get('message')}")
+    raise RuntimeError(f"FlareSolverr failed: {data.get('message')}")
 
 
 async def fetch_full_html(url):
@@ -69,18 +69,19 @@ async def fetch_full_html(url):
 
         page = await context.new_page()
 
-        print(f"Navigating to URL: {url}")
+        print(f"Navigating to: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        print("Scrolling full page to load all dynamic content...")
-        previous_height = 0
-        for step in range(15):
-            current_height = await page.evaluate("document.body.scrollHeight")
-            if current_height == previous_height and step > 4:
-                break
-            previous_height = current_height
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1200)
+        # Wait up to 15 seconds for match content to appear
+        try:
+            await page.wait_for_selector(".homeTeam, [class*='homeTeam']", timeout=15000)
+        except Exception:
+            print("Warning: .homeTeam selector timeout. Proceeding to page evaluation...")
+
+        print("Scrolling page to trigger lazy-loaded matches...")
+        for _ in range(12):
+            await page.evaluate("window.scrollBy(0, 2000)")
+            await page.wait_for_timeout(800)
 
         content = await page.content()
         await browser.close()
@@ -88,29 +89,27 @@ async def fetch_full_html(url):
 
 
 def get_probabilities(row):
-    # 1. Direct target of Forebet probability elements if available
-    p1 = row.select_one(".forebet_p1, [class*='p1']")
-    p2 = row.select_one(".forebet_p2, [class*='p2']")
-    p3 = row.select_one(".forebet_p3, [class*='p3']")
-
-    if p1 and p2 and p3:
-        try:
-            h = int(re.search(r"\d+", p1.get_text()).group())
-            d = int(re.search(r"\d+", p2.get_text()).group())
-            a = int(re.search(r"\d+", p3.get_text()).group())
+    # 1. Primary check: inspect dedicated probability containers
+    prob_containers = row.select(".tr_probabilities, .predict-probabilities, .prmnt, .fprt, [class*='prob']")
+    if prob_containers:
+        container_text = " ".join([c.get_text(" ", strip=True) for c in prob_containers])
+        numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", container_text)]
+        for i in range(len(numbers) - 2):
+            h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
             if 90 <= (h + d + a) <= 110:
                 return h, d, a
-        except (ValueError, AttributeError):
-            pass
 
-    # 2. Fallback: Strip team names from row copy to prevent digits in team names (e.g. "Mainz 05") from skewing calculations
+    # 2. Fallback check: sanitize row copy to avoid false numbers from team names or odds
     row_copy = BeautifulSoup(str(row), "html.parser")
-    for team_tag in row_copy.select(".homeTeam, .awayTeam, [class*='homeTeam'], [class*='awayTeam']"):
-        team_tag.decompose()
+    for noisy_selector in [
+        ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
+        ".forebet_odds", "[class*='odds']", ".l_score", "[class*='score']",
+        ".st-time", "[class*='time']", "[class*='date']"
+    ]:
+        for tag in row_copy.select(noisy_selector):
+            tag.decompose()
 
     numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", row_copy.get_text(" ", strip=True))]
-
-    # Find 3 consecutive numbers summing to ~100%
     for i in range(len(numbers) - 2):
         h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
         if 90 <= (h + d + a) <= 110:
@@ -133,26 +132,33 @@ def scrape_forebet(target_day):
     html_content = asyncio.run(fetch_full_html(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
-    home_elements = soup.select(".homeTeam, [class*='homeTeam']")
-    match_rows = []
+    # Find candidate tags containing exactly 1 home team and 1 away team
+    candidate_tags = []
+    for tag in soup.find_all(["div", "tr", "li", "article", "section"]):
+        homes = tag.select(".homeTeam, [class*='homeTeam']")
+        aways = tag.select(".awayTeam, [class*='awayTeam']")
+        if len(homes) == 1 and len(aways) == 1:
+            candidate_tags.append(tag)
 
-    for home_el in home_elements:
-        # Stop at the immediate parent row tag (tr, div, or li) containing awayTeam
-        row = home_el.find_parent(
-            lambda tag: tag.name in ["tr", "div", "li"]
-            and tag.select_one(".awayTeam, [class*='awayTeam']") is not None
-        )
-        if row and row not in match_rows:
-            # Confirm element is a single row wrapper
-            if len(row.select(".homeTeam, [class*='homeTeam']")) == 1:
-                match_rows.append(row)
+    # Isolate deepest containers (smallest HTML length first) to discard wrapper parents
+    candidate_tags.sort(key=lambda t: len(str(t)))
+    isolated_rows = []
+    for tag in candidate_tags:
+        if not any(existing_row in tag.descendants for existing_row in isolated_rows):
+            isolated_rows.append(tag)
 
-    print(f"Total match rows parsed: {len(match_rows)}")
+    stats = {
+        "raw_detected": len(isolated_rows),
+        "validated_parsed": 0,
+        "selected_picks": 0,
+    }
+
+    print(f"DOM Scan: {stats['raw_detected']} match rows detected.")
 
     results = []
     seen_matches = set()
 
-    for row in match_rows:
+    for row in isolated_rows:
         home_element = row.select_one(".homeTeam, [class*='homeTeam']")
         away_element = row.select_one(".awayTeam, [class*='awayTeam']")
 
@@ -165,6 +171,8 @@ def scrape_forebet(target_day):
 
         if not home_team or not away_team or probabilities is None:
             continue
+
+        stats["validated_parsed"] += 1
 
         home_prob, draw_prob, away_prob = probabilities
 
@@ -193,18 +201,21 @@ def scrape_forebet(target_day):
             }
         )
 
-    return sorted(
+    sorted_results = sorted(
         results,
         key=lambda item: (item["probability"], item["coefficient"]),
         reverse=True,
     )
 
+    stats["selected_picks"] = len(sorted_results)
+    print(f"Parsing Complete: {stats['validated_parsed']} matches validated, {stats['selected_picks']} picks selected.")
+
+    return sorted_results, stats
+
 
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets."
-        )
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables.")
 
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
@@ -222,28 +233,27 @@ if __name__ == "__main__":
     if target_day not in TARGET_URLS:
         target_day = "today"
 
-    picks = scrape_forebet(target_day)
+    picks, stats = scrape_forebet(target_day)
+
+    lines = [
+        f"⚽ Forebet picks for {target_day.upper()}",
+        f"Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%\n",
+    ]
 
     if picks:
-        lines = [
-            f"⚽ Forebet picks for {target_day.upper()}",
-            f"Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%\n",
-        ]
-
         for item in picks:
-            coef_str = (
-                f"{item['coefficient']:.2f}"
-                if item["coefficient"] > 0
-                else "N/A"
-            )
+            coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
             lines.append(f"• {item['home']} vs {item['away']}")
-            lines.append(
-                f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n"
-            )
-
-        message = "\n".join(lines)
+            lines.append(f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n")
     else:
-        message = f"No matches found for {target_day.upper()} matching ≥ {MINIMUM_PROBABILITY}% probability criteria."
+        lines.append("No matches found matching criteria.\n")
 
+    lines.append("---")
+    lines.append("📊 Validation Diagnostics:")
+    lines.append(f"• Match rows detected in DOM: {stats['raw_detected']}")
+    lines.append(f"• Validated matches parsed: {stats['validated_parsed']}")
+    lines.append(f"• Picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
+
+    message = "\n".join(lines)
     send_telegram_message(message)
-    print(f"Telegram message sent. Total matches selected: {len(picks)}")
+    print("Telegram notification dispatched successfully.")
