@@ -1,24 +1,24 @@
 name: Forebet Daily Scraper
 
 on:
-schedule:
-# 07:00 UTC = 10:00 AM in Saudi Arabia (UTC+3)
-- cron: "0 7 * * *"
+  schedule:
+    # 07:00 UTC = 10:00 AM in Saudi Arabia (UTC+3)
+    - cron: "0 7 * * *"
 
-workflow_dispatch:
-inputs:
-target_day:
-description: "Select the matches page"
-required: true
-default: "today"
-type: choice
-options:
-- today
-- tomorrow
+  workflow_dispatch:
+    inputs:
+      target_day:
+        description: "Select the matches page"
+        required: true
+        default: "today"
+        type: choice
+        options:
+          - today
+          - tomorrow
 
 jobs:
-scrape-and-send:
-runs-on: ubuntu-latest
+  scrape-and-send:
+    runs-on: ubuntu-latest
 
     services:
       flaresolverr:
@@ -26,14 +26,14 @@ runs-on: ubuntu-latest
         ports:
           - 8191:8191
 
-steps:
-- name: Checkout repository
-uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-- name: Set up Python
-uses: actions/setup-python@v5
-with:
-python-version: "3.11"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Wait for FlareSolverr Readiness
         run: |
@@ -43,15 +43,12 @@ python-version: "3.11"
           done
           echo "FlareSolverr is ready!"
 
-- name: Install dependencies
+      - name: Install dependencies
         run: pip install requests beautifulsoup4
-        run: |
-          pip install playwright playwright-stealth beautifulsoup4 requests
-          playwright install chromium
 
-     - name: Scrape Forebet and send Telegram message
-env:
-TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Scrape Forebet and send Telegram message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FLARESOLVERR_URL: "http://localhost:8191/v1"
-run: python -u scraper.py "${{ github.event.inputs.target_day || 'today' }}"
+        run: python -u scraper.py "${{ github.event.inputs.target_day || 'today' }}"
