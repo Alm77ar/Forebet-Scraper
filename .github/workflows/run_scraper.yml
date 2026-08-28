@@ -2,7 +2,6 @@ name: Forebet Daily Scraper
 
 on:
   schedule:
-    # 07:00 UTC = 10:00 AM in Saudi Arabia (UTC+3)
     - cron: "0 7 * * *"
 
   workflow_dispatch:
@@ -30,7 +29,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install curl-cffi beautifulsoup4
+        run: pip install cloudscraper requests beautifulsoup4
 
       - name: Scrape Forebet and send Telegram message
         env:
