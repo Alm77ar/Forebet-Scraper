@@ -26,7 +26,7 @@ def get_flaresolverr_clearance(url):
     }
     headers = {"Content-Type": "application/json"}
 
-    print(f"Requesting Cloudflare session via FlareSolverr: {url}")
+    print(f"Requesting Cloudflare clearance via FlareSolverr: {url}")
     response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
     response.raise_for_status()
 
@@ -77,32 +77,37 @@ async def fetch_full_html(url):
         except Exception:
             print("Warning: Selector timeout reached.")
 
-        print("Scrolling page dynamically until match loading completes...")
-        previous_count = 0
-        no_change_iterations = 0
+        print("Scrolling page dynamically and triggering lazy-loaders...")
+        last_match_count = 0
+        stagnant_iterations = 0
 
-        for step in range(35):
-            await page.evaluate("window.scrollBy(0, 1500)")
-            await page.wait_for_timeout(800)
+        for step in range(40):
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
 
-            # Click any load-more elements if present
-            load_more = await page.query_selector("a#loadMore, .load-more, #btn_load_more")
-            if load_more and await load_more.is_visible():
-                try:
-                    await load_more.click()
-                    await page.wait_for_timeout(1200)
-                except Exception:
-                    pass
+            # Trigger potential 'Load More' buttons
+            try:
+                load_buttons = await page.query_selector_all(
+                    "a[id*='more'], button[id*='more'], .load-more, .schema-more, [class*='more']"
+                )
+                for btn in load_buttons:
+                    if await btn.is_visible():
+                        await btn.click()
+                        await page.wait_for_timeout(1000)
+            except Exception:
+                pass
 
             current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
-            if current_count == previous_count and current_count > 0:
-                no_change_iterations += 1
-                if no_change_iterations >= 4:
-                    print(f"Match loading completed at {current_count} total matches.")
+            print(f"Scroll step {step + 1}: {current_count} match nodes loaded")
+
+            if current_count == last_match_count and current_count > 0:
+                stagnant_iterations += 1
+                if stagnant_iterations >= 5:
+                    print(f"Dynamic loading complete. Total matches captured: {current_count}")
                     break
             else:
-                no_change_iterations = 0
-                previous_count = current_count
+                stagnant_iterations = 0
+                last_match_count = current_count
 
         content = await page.content()
         await browser.close()
@@ -110,17 +115,30 @@ async def fetch_full_html(url):
 
 
 def get_probabilities(row):
-    # 1. Primary check on designated probability containers
-    prob_element = row.select_one(".fprt, .tr_probabilities, .predict-probabilities, [class*='prob']")
-    if prob_element:
-        text = prob_element.get_text(" ", strip=True)
-        nums = [int(n) for n in re.findall(r"\b\d{1,3}\b", text)]
+    # 1. Check explicit Forebet outcome classes
+    p1 = row.select_one(".forebet_p1, [class*='p1']")
+    p2 = row.select_one(".forebet_p2, [class*='p2']")
+    p3 = row.select_one(".forebet_p3, [class*='p3']")
+    if p1 and p2 and p3:
+        m1 = re.search(r"\d+", p1.get_text())
+        m2 = re.search(r"\d+", p2.get_text())
+        m3 = re.search(r"\d+", p3.get_text())
+        if m1 and m2 and m3:
+            h, d, a = int(m1.group()), int(m2.group()), int(m3.group())
+            if 90 <= (h + d + a) <= 110:
+                return h, d, a
+
+    # 2. Extract from designated probability elements
+    prob_elements = row.select(".tr_probabilities, .predict-probabilities, .fprt, .fprmnt, [class*='prob']")
+    if prob_elements:
+        combined_text = " ".join([el.get_text(" ", strip=True) for el in prob_elements])
+        nums = [int(n) for n in re.findall(r"\b\d{1,3}\b", combined_text)]
         for i in range(len(nums) - 2):
             h, d, a = nums[i], nums[i + 1], nums[i + 2]
             if 90 <= (h + d + a) <= 110:
                 return h, d, a
 
-    # 2. Sanitized fallback check across the container
+    # 3. Fallback: Parse row text with metadata/team names removed
     row_copy = BeautifulSoup(str(row), "html.parser")
     for noisy_selector in [
         ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
@@ -154,50 +172,44 @@ def scrape_forebet(target_day):
     soup = BeautifulSoup(html_content, "html.parser")
 
     home_elements = soup.select(".homeTeam, [class*='homeTeam']")
-    match_rows = []
-
-    for home_el in home_elements:
-        curr = home_el.parent
-        row_container = None
-
-        # Ascend DOM hierarchy to find the complete row container that includes probability data
-        while curr and curr.name not in ["body", "html"]:
-            if curr.select_one(".awayTeam, [class*='awayTeam']"):
-                homes = curr.select(".homeTeam, [class*='homeTeam']")
-                aways = curr.select(".awayTeam, [class*='awayTeam']")
-                if len(homes) == 1 and len(aways) == 1:
-                    if get_probabilities(curr) is not None:
-                        row_container = curr
-                        break
-            curr = curr.parent
-
-        if row_container and row_container not in match_rows:
-            match_rows.append(row_container)
-
-    stats = {
-        "raw_detected": len(home_elements),
-        "validated_parsed": len(match_rows),
-        "selected_picks": 0,
-    }
-
-    print(f"DOM Analysis: {stats['raw_detected']} match nodes found, {stats['validated_parsed']} full rows validated.")
 
     results = []
     seen_matches = set()
+    validated_count = 0
 
-    for row in match_rows:
-        home_element = row.select_one(".homeTeam, [class*='homeTeam']")
-        away_element = row.select_one(".awayTeam, [class*='awayTeam']")
+    for home_el in home_elements:
+        # Ascend DOM until finding the ancestor row containing BOTH awayTeam and probabilities
+        curr = home_el.parent
+        row_container = None
+        probabilities = None
+
+        while curr and curr.name not in ["html", "body"]:
+            if curr.select_one(".awayTeam, [class*='awayTeam']"):
+                probs = get_probabilities(curr)
+                if probs is not None:
+                    row_container = curr
+                    probabilities = probs
+                    break
+            curr = curr.parent
+
+        if not row_container or probabilities is None:
+            continue
+
+        home_element = row_container.select_one(".homeTeam, [class*='homeTeam']")
+        away_element = row_container.select_one(".awayTeam, [class*='awayTeam']")
 
         if not home_element or not away_element:
             continue
 
         home_team = home_element.get_text(" ", strip=True)
         away_team = away_element.get_text(" ", strip=True)
-        probabilities = get_probabilities(row)
 
-        if not home_team or not away_team or probabilities is None:
+        match_key = (home_team, away_team)
+        if match_key in seen_matches:
             continue
+
+        seen_matches.add(match_key)
+        validated_count += 1
 
         home_prob, draw_prob, away_prob = probabilities
 
@@ -211,20 +223,21 @@ def scrape_forebet(target_day):
             pick = "2 — Away win"
             prob = away_prob
 
-        match_key = (home_team, away_team)
-        if match_key in seen_matches:
-            continue
-
-        seen_matches.add(match_key)
         results.append(
             {
                 "home": home_team,
                 "away": away_team,
                 "pick": pick,
                 "probability": prob,
-                "coefficient": get_coefficient(row),
+                "coefficient": get_coefficient(row_container),
             }
         )
+
+    stats = {
+        "raw_detected": len(home_elements),
+        "validated_parsed": validated_count,
+        "selected_picks": len(results),
+    }
 
     sorted_results = sorted(
         results,
@@ -232,7 +245,6 @@ def scrape_forebet(target_day):
         reverse=True,
     )
 
-    stats["selected_picks"] = len(sorted_results)
     return sorted_results, stats
 
 
