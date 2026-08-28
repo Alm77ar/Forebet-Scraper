@@ -72,16 +72,37 @@ async def fetch_full_html(url):
         print(f"Navigating to: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        # Wait up to 15 seconds for match content to appear
         try:
             await page.wait_for_selector(".homeTeam, [class*='homeTeam']", timeout=15000)
         except Exception:
-            print("Warning: .homeTeam selector timeout. Proceeding to page evaluation...")
+            print("Warning: Selector timeout reached.")
 
-        print("Scrolling page to trigger lazy-loaded matches...")
-        for _ in range(12):
-            await page.evaluate("window.scrollBy(0, 2000)")
+        print("Scrolling page dynamically until match loading completes...")
+        previous_count = 0
+        no_change_iterations = 0
+
+        for step in range(35):
+            await page.evaluate("window.scrollBy(0, 1500)")
             await page.wait_for_timeout(800)
+
+            # Click any load-more elements if present
+            load_more = await page.query_selector("a#loadMore, .load-more, #btn_load_more")
+            if load_more and await load_more.is_visible():
+                try:
+                    await load_more.click()
+                    await page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+
+            current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
+            if current_count == previous_count and current_count > 0:
+                no_change_iterations += 1
+                if no_change_iterations >= 4:
+                    print(f"Match loading completed at {current_count} total matches.")
+                    break
+            else:
+                no_change_iterations = 0
+                previous_count = current_count
 
         content = await page.content()
         await browser.close()
@@ -89,22 +110,22 @@ async def fetch_full_html(url):
 
 
 def get_probabilities(row):
-    # 1. Primary check: inspect dedicated probability containers
-    prob_containers = row.select(".tr_probabilities, .predict-probabilities, .prmnt, .fprt, [class*='prob']")
-    if prob_containers:
-        container_text = " ".join([c.get_text(" ", strip=True) for c in prob_containers])
-        numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", container_text)]
-        for i in range(len(numbers) - 2):
-            h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
+    # 1. Primary check on designated probability containers
+    prob_element = row.select_one(".fprt, .tr_probabilities, .predict-probabilities, [class*='prob']")
+    if prob_element:
+        text = prob_element.get_text(" ", strip=True)
+        nums = [int(n) for n in re.findall(r"\b\d{1,3}\b", text)]
+        for i in range(len(nums) - 2):
+            h, d, a = nums[i], nums[i + 1], nums[i + 2]
             if 90 <= (h + d + a) <= 110:
                 return h, d, a
 
-    # 2. Fallback check: sanitize row copy to avoid false numbers from team names or odds
+    # 2. Sanitized fallback check across the container
     row_copy = BeautifulSoup(str(row), "html.parser")
     for noisy_selector in [
         ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
         ".forebet_odds", "[class*='odds']", ".l_score", "[class*='score']",
-        ".st-time", "[class*='time']", "[class*='date']"
+        ".st-time", "[class*='time']", ".date", "[class*='date']"
     ]:
         for tag in row_copy.select(noisy_selector):
             tag.decompose()
@@ -132,33 +153,39 @@ def scrape_forebet(target_day):
     html_content = asyncio.run(fetch_full_html(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Find candidate tags containing exactly 1 home team and 1 away team
-    candidate_tags = []
-    for tag in soup.find_all(["div", "tr", "li", "article", "section"]):
-        homes = tag.select(".homeTeam, [class*='homeTeam']")
-        aways = tag.select(".awayTeam, [class*='awayTeam']")
-        if len(homes) == 1 and len(aways) == 1:
-            candidate_tags.append(tag)
+    home_elements = soup.select(".homeTeam, [class*='homeTeam']")
+    match_rows = []
 
-    # Isolate deepest containers (smallest HTML length first) to discard wrapper parents
-    candidate_tags.sort(key=lambda t: len(str(t)))
-    isolated_rows = []
-    for tag in candidate_tags:
-        if not any(existing_row in tag.descendants for existing_row in isolated_rows):
-            isolated_rows.append(tag)
+    for home_el in home_elements:
+        curr = home_el.parent
+        row_container = None
+
+        # Ascend DOM hierarchy to find the complete row container that includes probability data
+        while curr and curr.name not in ["body", "html"]:
+            if curr.select_one(".awayTeam, [class*='awayTeam']"):
+                homes = curr.select(".homeTeam, [class*='homeTeam']")
+                aways = curr.select(".awayTeam, [class*='awayTeam']")
+                if len(homes) == 1 and len(aways) == 1:
+                    if get_probabilities(curr) is not None:
+                        row_container = curr
+                        break
+            curr = curr.parent
+
+        if row_container and row_container not in match_rows:
+            match_rows.append(row_container)
 
     stats = {
-        "raw_detected": len(isolated_rows),
-        "validated_parsed": 0,
+        "raw_detected": len(home_elements),
+        "validated_parsed": len(match_rows),
         "selected_picks": 0,
     }
 
-    print(f"DOM Scan: {stats['raw_detected']} match rows detected.")
+    print(f"DOM Analysis: {stats['raw_detected']} match nodes found, {stats['validated_parsed']} full rows validated.")
 
     results = []
     seen_matches = set()
 
-    for row in isolated_rows:
+    for row in match_rows:
         home_element = row.select_one(".homeTeam, [class*='homeTeam']")
         away_element = row.select_one(".awayTeam, [class*='awayTeam']")
 
@@ -171,8 +198,6 @@ def scrape_forebet(target_day):
 
         if not home_team or not away_team or probabilities is None:
             continue
-
-        stats["validated_parsed"] += 1
 
         home_prob, draw_prob, away_prob = probabilities
 
@@ -208,8 +233,6 @@ def scrape_forebet(target_day):
     )
 
     stats["selected_picks"] = len(sorted_results)
-    print(f"Parsing Complete: {stats['validated_parsed']} matches validated, {stats['selected_picks']} picks selected.")
-
     return sorted_results, stats
 
 
@@ -250,8 +273,8 @@ if __name__ == "__main__":
 
     lines.append("---")
     lines.append("📊 Validation Diagnostics:")
-    lines.append(f"• Match rows detected in DOM: {stats['raw_detected']}")
-    lines.append(f"• Validated matches parsed: {stats['validated_parsed']}")
+    lines.append(f"• Match nodes detected in DOM: {stats['raw_detected']}")
+    lines.append(f"• Validated match rows parsed: {stats['validated_parsed']}")
     lines.append(f"• Picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
 
     message = "\n".join(lines)
