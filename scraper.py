@@ -19,15 +19,14 @@ MINIMUM_PROBABILITY = 75
 
 
 def get_flaresolverr_clearance(url):
-    """Obtains Cloudflare cookies and User-Agent using FlareSolverr."""
     payload = {
         "cmd": "request.get",
         "url": url,
         "maxTimeout": 60000,
     }
     headers = {"Content-Type": "application/json"}
-    
-    print(f"Requesting Cloudflare clearance via FlareSolverr for: {url}")
+
+    print(f"Obtaining Cloudflare session clearance via FlareSolverr for: {url}")
     response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
     response.raise_for_status()
 
@@ -36,11 +35,10 @@ def get_flaresolverr_clearance(url):
         solution = data["solution"]
         return solution.get("cookies", []), solution.get("userAgent", "")
 
-    raise RuntimeError(f"FlareSolverr failed: {data.get('message')}")
+    raise RuntimeError(f"FlareSolverr clearance failed: {data.get('message')}")
 
 
 async def fetch_full_html(url):
-    """Uses Playwright with FlareSolverr cookies to scroll and load all matches."""
     cookies, user_agent = get_flaresolverr_clearance(url)
 
     async with async_playwright() as p:
@@ -53,32 +51,37 @@ async def fetch_full_html(url):
             ],
         )
 
-        pw_cookies = []
-        for c in cookies:
-            cookie_dict = {
+        pw_cookies = [
+            {
                 "name": c["name"],
                 "value": c["value"],
                 "domain": c["domain"],
                 "path": c.get("path", "/"),
             }
-            pw_cookies.append(cookie_dict)
+            for c in cookies
+        ]
 
         context = await browser.new_context(
             user_agent=user_agent,
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 1000},
         )
         await context.add_cookies(pw_cookies)
 
         page = await context.new_page()
 
-        print(f"Navigating with authenticated session to: {url}")
+        print(f"Navigating to match table: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        # Scroll to bottom in increments to trigger dynamic lazy loading
-        print("Scrolling full page to load all matches...")
-        for _ in range(12):
-            await page.evaluate("window.scrollBy(0, 2500)")
-            await page.wait_for_timeout(1000)
+        # Dynamic scroll loop: scroll until page height stops increasing or 15 iterations reached
+        print("Scrolling page dynamically to trigger all lazy-loaded matches...")
+        previous_height = 0
+        for step in range(15):
+            current_height = await page.evaluate("document.body.scrollHeight")
+            if current_height == previous_height and step > 5:
+                break
+            previous_height = current_height
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1200)
 
         content = await page.content()
         await browser.close()
@@ -86,17 +89,11 @@ async def fetch_full_html(url):
 
 
 def get_probabilities(row):
-    """Extracts probabilities using a sliding window to handle extra digits in row text."""
-    prob_element = row.select_one(".fprt, .tr_probabilities, [class*='prob']")
-    search_text = (
-        prob_element.get_text(" ", strip=True)
-        if prob_element
-        else row.get_text(" ", strip=True)
-    )
+    # Extract row text directly to prevent picking up single-digit recommendation tags (.fprt)
+    row_text = row.get_text(" ", strip=True)
+    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", row_text)]
 
-    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", search_text)]
-
-    # Look for 3 consecutive numbers that sum to ~100%
+    # Search for 3 consecutive integers summing to ~100% (1X2 probability percentages)
     for i in range(len(numbers) - 2):
         h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
         if 90 <= (h + d + a) <= 110:
@@ -123,7 +120,7 @@ def scrape_forebet(target_day):
         "div.rcnt, div[class*='rcnt'], .schema-row, tr.schema-row, tr[class*='schema']"
     )
 
-    print(f"Total match rows parsed from DOM: {len(rows)}")
+    print(f"Total raw match rows parsed from DOM: {len(rows)}")
 
     results = []
     seen_matches = set()
