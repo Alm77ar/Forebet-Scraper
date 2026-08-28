@@ -1,13 +1,13 @@
 import os
 import re
 import sys
-import time
-import requests
+import asyncio
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
 
 TARGET_URLS = {
     "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today",
@@ -17,49 +17,44 @@ TARGET_URLS = {
 MINIMUM_PROBABILITY = 75
 
 
-def fetch_html_flaresolverr(url):
-    session_id = f"forebet_session_{int(time.time())}"
-    
-    # 1. Create FlareSolverr Session
-    try:
-        requests.post(
-            FLARESOLVERR_URL,
-            json={"cmd": "sessions.create", "session": session_id},
-            timeout=30,
+async def fetch_html_playwright(url):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
         )
-    except Exception as e:
-        print(f"Session creation warning: {e}")
-
-    # 2. Execute GET Request through Session
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "session": session_id,
-        "maxTimeout": 120000,
-    }
-    headers = {"Content-Type": "application/json"}
-
-    print(f"Sending request to FlareSolverr for: {url}")
-    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=130)
-    response.raise_for_status()
-
-    data = response.json()
-
-    # 3. Destroy Session
-    try:
-        requests.post(
-            FLARESOLVERR_URL,
-            json={"cmd": "sessions.destroy", "session": session_id},
-            timeout=15,
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
         )
-    except Exception:
-        pass
+        page = await context.new_page()
+        await stealth_async(page)
 
-    if data.get("status") == "ok":
-        print("FlareSolverr successfully bypassed Cloudflare.")
-        return data["solution"]["response"]
+        print(f"Navigating to: {url}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-    raise RuntimeError(f"FlareSolverr error: {data.get('message')}")
+        # Wait for initial match containers to appear
+        try:
+            await page.wait_for_selector(
+                ".rcnt, div[class*='rcnt'], .schema-row, tr[class*='schema']",
+                timeout=20000,
+            )
+        except Exception:
+            print("Selector wait timed out, continuing with loaded content...")
+
+        # Scroll incrementally to trigger lazy-loaded match rows
+        print("Scrolling page to load lazy content...")
+        for _ in range(5):
+            await page.evaluate("window.scrollBy(0, 1500)")
+            await page.wait_for_timeout(800)
+
+        content = await page.content()
+        await browser.close()
+        return content
 
 
 def numbers_in_text(text):
@@ -70,6 +65,7 @@ def numbers_in_text(text):
 
 
 def get_probabilities(row):
+    # Search targeted containers first
     containers = row.select(
         ".tr_probabilities, "
         "[class*='probabilities'], "
@@ -79,12 +75,13 @@ def get_probabilities(row):
 
     for container in containers:
         values = numbers_in_text(container.get_text(" ", strip=True))
-        if len(values) == 3 and 95 <= sum(values) <= 105:
+        if len(values) == 3 and 90 <= sum(values) <= 110:
             return values[0], values[1], values[2]
 
+    # Fallback search across all child elements inside the row
     for element in row.find_all(["div", "span", "td"]):
         values = numbers_in_text(element.get_text(" ", strip=True))
-        if len(values) == 3 and 95 <= sum(values) <= 105:
+        if len(values) == 3 and 90 <= sum(values) <= 110:
             return values[0], values[1], values[2]
 
     return None
@@ -101,17 +98,20 @@ def get_coefficient(row):
 
 def scrape_forebet(target_day):
     url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
-    html_content = fetch_html_flaresolverr(url)
+    html_content = asyncio.run(fetch_html_playwright(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
+    # Expanded selector query to catch secondary/minor league match wrappers
     rows = soup.select(
         "div.rcnt, "
         "div[class*='rcnt'], "
         ".schema-row, "
-        "tr.schema-row"
+        "tr.schema-row, "
+        "tr[class*='schema'], "
+        "div[class*='schema']"
     )
 
-    print(f"Match rows detected: {len(rows)}")
+    print(f"Total raw match rows detected: {len(rows)}")
 
     results = []
     seen_matches = set()
@@ -132,6 +132,7 @@ def scrape_forebet(target_day):
 
         home_prob, draw_prob, away_prob = probabilities
 
+        # Filter against Home or Away probability threshold
         if home_prob < MINIMUM_PROBABILITY and away_prob < MINIMUM_PROBABILITY:
             continue
 
@@ -165,6 +166,8 @@ def scrape_forebet(target_day):
 
 
 def send_telegram_message(message):
+    import requests
+
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets.")
 
