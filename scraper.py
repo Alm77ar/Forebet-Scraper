@@ -35,12 +35,12 @@ def fetch_html_flaresolverr(url):
         "cmd": "request.get",
         "url": url,
         "session": session_id,
-        "maxTimeout": 120000,
+        "maxTimeout": 300000,
     }
     headers = {"Content-Type": "application/json"}
 
     print(f"Sending request to FlareSolverr for: {url}")
-    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=130)
+    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=310)
     response.raise_for_status()
 
     data = response.json()
