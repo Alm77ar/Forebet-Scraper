@@ -1,4 +1,3 @@
-@@ -1,46 +1,54 @@
 name: Forebet Daily Scraper
 
 on:
@@ -21,12 +20,6 @@ jobs:
   scrape-and-send:
     runs-on: ubuntu-latest
 
-    services:
-      flaresolverr:
-        image: ghcr.io/flaresolverr/flaresolverr:latest
-        ports:
-          - 8191:8191
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,20 +29,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Wait for FlareSolverr Readiness
-        run: |
-          echo "Waiting for FlareSolverr..."
-          until curl -s http://localhost:8191/ | grep -q "FlareSolverr"; do
-            sleep 2
-          done
-          echo "FlareSolverr is ready!"
-
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          pip install playwright playwright-stealth beautifulsoup4 requests
+          playwright install chromium
 
       - name: Scrape Forebet and send Telegram message
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FLARESOLVERR_URL: "http://localhost:8191/v1"
         run: python -u scraper.py "${{ github.event.inputs.target_day || 'today' }}"
