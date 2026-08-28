@@ -2,7 +2,6 @@ name: Forebet Daily Scraper
 
 on:
   schedule:
-    # 07:00 UTC = 10:00 AM in Saudi Arabia (UTC+3)
     - cron: "0 7 * * *"
 
   workflow_dispatch:
@@ -19,6 +18,7 @@ on:
 jobs:
   scrape-and-send:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     services:
       flaresolverr:
@@ -44,7 +44,9 @@ jobs:
           echo "FlareSolverr is ready!"
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4
+        run: |
+          pip install playwright playwright-stealth beautifulsoup4 requests
+          playwright install chromium
 
       - name: Scrape Forebet and send Telegram message
         timeout-minutes: 10
