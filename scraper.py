@@ -5,7 +5,6 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -41,7 +40,7 @@ def get_flaresolverr_clearance(url):
 
 
 async def fetch_full_html(url):
-    """Uses Playwright injected with FlareSolverr cookies to scroll and load all matches."""
+    """Uses Playwright with FlareSolverr cookies to scroll and load all matches."""
     cookies, user_agent = get_flaresolverr_clearance(url)
 
     async with async_playwright() as p:
@@ -71,7 +70,6 @@ async def fetch_full_html(url):
         await context.add_cookies(pw_cookies)
 
         page = await context.new_page()
-        await stealth_async(page)
 
         print(f"Navigating with authenticated session to: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
