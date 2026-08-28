@@ -26,7 +26,7 @@ def get_flaresolverr_clearance(url):
     }
     headers = {"Content-Type": "application/json"}
 
-    print(f"Obtaining Cloudflare session clearance via FlareSolverr for: {url}")
+    print(f"Obtaining Cloudflare clearance via FlareSolverr for: {url}")
     response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
     response.raise_for_status()
 
@@ -69,15 +69,14 @@ async def fetch_full_html(url):
 
         page = await context.new_page()
 
-        print(f"Navigating to match table: {url}")
+        print(f"Navigating to URL: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        # Dynamic scroll loop: scroll until page height stops increasing or 15 iterations reached
-        print("Scrolling page dynamically to trigger all lazy-loaded matches...")
+        print("Scrolling full page to load all matches dynamically...")
         previous_height = 0
         for step in range(15):
             current_height = await page.evaluate("document.body.scrollHeight")
-            if current_height == previous_height and step > 5:
+            if current_height == previous_height and step > 4:
                 break
             previous_height = current_height
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -89,11 +88,13 @@ async def fetch_full_html(url):
 
 
 def get_probabilities(row):
-    # Extract row text directly to prevent picking up single-digit recommendation tags (.fprt)
-    row_text = row.get_text(" ", strip=True)
-    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", row_text)]
+    # Search specifically inside probability containers first to avoid odds/time digit interference
+    prob_container = row.select_one(".tr_probabilities, .predict-probabilities, [class*='prob']")
+    search_text = prob_container.get_text(" ", strip=True) if prob_container else row.get_text(" ", strip=True)
 
-    # Search for 3 consecutive integers summing to ~100% (1X2 probability percentages)
+    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", search_text)]
+
+    # Sliding window to locate 3 consecutive numbers summing to ~100%
     for i in range(len(numbers) - 2):
         h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
         if 90 <= (h + d + a) <= 110:
@@ -116,16 +117,27 @@ def scrape_forebet(target_day):
     html_content = asyncio.run(fetch_full_html(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
-    rows = soup.select(
-        "div.rcnt, div[class*='rcnt'], .schema-row, tr.schema-row, tr[class*='schema']"
-    )
+    # Locate individual match rows by finding homeTeam nodes and resolving their single-match parent row
+    home_nodes = soup.select(".homeTeam, [class*='homeTeam']")
+    match_rows = []
 
-    print(f"Total raw match rows parsed from DOM: {len(rows)}")
+    for home_el in home_nodes:
+        # Find closest ancestor containing awayTeam
+        parent = home_el.find_parent(
+            lambda tag: tag.select_one(".awayTeam, [class*='awayTeam']") is not None
+            and tag.name not in ["html", "body"]
+        )
+        if parent and parent not in match_rows:
+            # Ensure ancestor is an individual match row (contains only 1 homeTeam element)
+            if len(parent.select(".homeTeam, [class*='homeTeam']")) == 1:
+                match_rows.append(parent)
+
+    print(f"Total isolated match rows detected: {len(match_rows)}")
 
     results = []
     seen_matches = set()
 
-    for row in rows:
+    for row in match_rows:
         home_element = row.select_one(".homeTeam, [class*='homeTeam']")
         away_element = row.select_one(".awayTeam, [class*='awayTeam']")
 
