@@ -27,35 +27,35 @@ HEADERS = {
 
 
 def numbers_in_text(text):
-    """Return all whole-number values from text."""
-    return [int(value) for value in re.findall(r"(?<![\d.])(\d{1,3})(?![\d.])", text)]
+    return [
+        int(value)
+        for value in re.findall(r"(?<![\d.])(\d{1,3})(?![\d.])", text)
+    ]
 
 
 def get_probabilities(row):
     """
-    Forebet displays probabilities in this order:
-    1 (home win), X (draw), 2 (away win).
-
-    Return: home_probability, draw_probability, away_probability
+    Forebet values are ordered:
+    1 = home win, X = draw, 2 = away win.
     """
-    probability_containers = row.select(
+    containers = row.select(
         ".tr_probabilities, "
         "[class*='probabilities'], "
         "[class*='probability'], "
         "[class*='prob']"
     )
 
-    for container in probability_containers:
+    for container in containers:
         values = numbers_in_text(container.get_text(" ", strip=True))
 
-        if len(values) == 3 and sum(values) >= 95 and sum(values) <= 105:
+        if len(values) == 3 and 95 <= sum(values) <= 105:
             return values[0], values[1], values[2]
 
-    # Backup method for a future Forebet class-name change.
+    # Backup if Forebet changes the class name.
     for element in row.find_all(["div", "span", "td"]):
         values = numbers_in_text(element.get_text(" ", strip=True))
 
-        if len(values) == 3 and sum(values) >= 95 and sum(values) <= 105:
+        if len(values) == 3 and 95 <= sum(values) <= 105:
             return values[0], values[1], values[2]
 
     return None
@@ -77,12 +77,21 @@ def scrape_forebet(target_day):
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
         response.raise_for_status()
+
+    except requests.HTTPError as error:
+        if error.response is not None and error.response.status_code == 403:
+            raise RuntimeError(
+                "Forebet blocked this computer or server (HTTP 403). "
+                "GitHub Actions cannot access the page from its hosted server."
+            ) from error
+
+        raise RuntimeError(f"Forebet returned an error: {error}") from error
+
     except requests.RequestException as error:
-        raise RuntimeError(f"Could not load Forebet: {error}") from error
+        raise RuntimeError(f"Could not connect to Forebet: {error}") from error
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Forebet currently uses rcnt match rows.
     rows = soup.select(
         "div.rcnt, "
         "div[class*='rcnt'], "
@@ -105,17 +114,14 @@ def scrape_forebet(target_day):
         home_team = home_element.get_text(" ", strip=True)
         away_team = away_element.get_text(" ", strip=True)
 
-        if not home_team or not away_team:
-            continue
-
         probabilities = get_probabilities(row)
 
-        if probabilities is None:
+        if not home_team or not away_team or probabilities is None:
             continue
 
         home_probability, draw_probability, away_probability = probabilities
 
-        # Check only columns 1 and 2. X is intentionally ignored.
+        # Only check 1 (home) and 2 (away). Ignore X (draw).
         if (
             home_probability < MINIMUM_PROBABILITY
             and away_probability < MINIMUM_PROBABILITY
@@ -146,7 +152,6 @@ def scrape_forebet(target_day):
             }
         )
 
-    # Highest winning probability first; COEF breaks a tie.
     return sorted(
         results,
         key=lambda item: (item["probability"], item["coefficient"]),
