@@ -1,12 +1,12 @@
 import os
 import re
 import sys
-import cloudscraper
 import requests
 from bs4 import BeautifulSoup
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
 
 TARGET_URLS = {
     "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today",
@@ -16,42 +16,24 @@ TARGET_URLS = {
 MINIMUM_PROBABILITY = 75
 
 
-def fetch_html(url):
-    # Method 1: Direct fetch via Cloudscraper
-    try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        response = scraper.get(url, timeout=15)
-        if response.status_code == 200 and "rcnt" in response.text:
-            print("Direct fetch via Cloudscraper succeeded.")
-            return response.text
-    except Exception as e:
-        print(f"Direct Cloudscraper fetch failed: {e}")
+def fetch_html_flaresolverr(url):
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": 60000
+    }
+    headers = {"Content-Type": "application/json"}
 
-    # Method 2: AllOrigins raw HTML proxy
-    try:
-        print("Switching to AllOrigins Proxy...")
-        proxy_url = f"https://api.allorigins.win/raw?url={url}"
-        response = requests.get(proxy_url, timeout=20)
-        if response.status_code == 200 and len(response.text) > 5000:
-            print("AllOrigins proxy fetch succeeded.")
-            return response.text
-    except Exception as e:
-        print(f"AllOrigins proxy failed: {e}")
+    print(f"Sending request to FlareSolverr for: {url}")
+    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
+    response.raise_for_status()
 
-    # Method 3: CodeTabs raw HTML proxy
-    try:
-        print("Switching to CodeTabs Proxy...")
-        proxy_url = f"https://api.codetabs.com/v1/proxy?quest={url}"
-        response = requests.get(proxy_url, timeout=20)
-        if response.status_code == 200 and len(response.text) > 5000:
-            print("CodeTabs proxy fetch succeeded.")
-            return response.text
-    except Exception as e:
-        print(f"CodeTabs proxy failed: {e}")
-
-    raise RuntimeError("All connection methods (Direct & Proxies) failed to retrieve page content.")
+    data = response.json()
+    if data.get("status") == "ok":
+        print("FlareSolverr successfully bypassed Cloudflare.")
+        return data["solution"]["response"]
+    
+    raise RuntimeError(f"FlareSolverr returned error: {data.get('message')}")
 
 
 def numbers_in_text(text):
@@ -93,7 +75,7 @@ def get_coefficient(row):
 
 def scrape_forebet(target_day):
     url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
-    html_content = fetch_html(url)
+    html_content = fetch_html_flaresolverr(url)
     soup = BeautifulSoup(html_content, "html.parser")
 
     rows = soup.select(
@@ -194,4 +176,4 @@ if __name__ == "__main__":
         message = f"No matches found for {target_day.upper()} matching ≥ {MINIMUM_PROBABILITY}% probability criteria."
 
     send_telegram_message(message)
-    print(f"Telegram message sent. Total matches selected: {len(picks)}")
+    print(f"Telegram message sent. Matches selected: {len(picks)}")
