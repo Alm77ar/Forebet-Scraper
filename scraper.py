@@ -35,7 +35,7 @@ def get_flaresolverr_clearance(url):
         solution = data["solution"]
         return solution.get("cookies", []), solution.get("userAgent", "")
 
-    raise RuntimeError(f"FlareSolverr failed: {data.get('message')}")
+    raise RuntimeError(f"FlareSolverr clearance failed: {data.get('message')}")
 
 
 async def fetch_full_html(url):
@@ -48,6 +48,7 @@ async def fetch_full_html(url):
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
             ],
         )
 
@@ -63,92 +64,88 @@ async def fetch_full_html(url):
 
         context = await browser.new_context(
             user_agent=user_agent,
-            viewport={"width": 1280, "height": 1000},
+            viewport={"width": 1440, "height": 900},
         )
         await context.add_cookies(pw_cookies)
 
+        # Mask automation footprint to allow sub-resource AJAX calls through Cloudflare
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
         page = await context.new_page()
 
-        print(f"Navigating to: {url}")
+        print(f"Navigating to match table: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
+        # Wait for dynamic matches to hydrate into the DOM
         try:
-            await page.wait_for_selector(".homeTeam, [class*='homeTeam']", timeout=15000)
+            await page.wait_for_function(
+                "document.querySelectorAll('.homeTeam, [class*=\"homeTeam\"]').length > 10",
+                timeout=20000,
+            )
+            print("Match list hydrated successfully.")
         except Exception:
-            print("Warning: Selector timeout reached.")
+            print("Warning: Initial hydration timeout reached. Continuing with incremental scroll...")
 
-        print("Scrolling page dynamically and triggering lazy-loaders...")
-        last_match_count = 0
-        stagnant_iterations = 0
+        # Incremental step scroll to trigger IntersectionObserver and scroll listeners
+        print("Executing incremental step scrolling...")
+        last_count = 0
+        stagnant_steps = 0
 
-        for step in range(40):
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1000)
+        for step in range(30):
+            await page.evaluate("window.scrollBy(0, 800);")
+            await page.wait_for_timeout(600)
 
-            # Trigger potential 'Load More' buttons
+            # Click any dynamic pagination or 'More' buttons if present
             try:
-                load_buttons = await page.query_selector_all(
-                    "a[id*='more'], button[id*='more'], .load-more, .schema-more, [class*='more']"
+                more_btn = await page.query_selector(
+                    "#btn_more, .schema-more, a[id*='more'], button[id*='more']"
                 )
-                for btn in load_buttons:
-                    if await btn.is_visible():
-                        await btn.click()
-                        await page.wait_for_timeout(1000)
+                if more_btn and await more_btn.is_visible():
+                    await more_btn.click()
+                    await page.wait_for_timeout(1000)
             except Exception:
                 pass
 
             current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
-            print(f"Scroll step {step + 1}: {current_count} match nodes loaded")
 
-            if current_count == last_match_count and current_count > 0:
-                stagnant_iterations += 1
-                if stagnant_iterations >= 5:
-                    print(f"Dynamic loading complete. Total matches captured: {current_count}")
+            if current_count == last_count and current_count > 15:
+                stagnant_steps += 1
+                if stagnant_steps >= 5:
+                    print(f"Scroll complete: Captured {current_count} matches.")
                     break
             else:
-                stagnant_iterations = 0
-                last_match_count = current_count
+                stagnant_steps = 0
+                last_count = current_count
 
         content = await page.content()
         await browser.close()
         return content
 
 
-def get_probabilities(row):
-    # 1. Check explicit Forebet outcome classes
-    p1 = row.select_one(".forebet_p1, [class*='p1']")
-    p2 = row.select_one(".forebet_p2, [class*='p2']")
-    p3 = row.select_one(".forebet_p3, [class*='p3']")
-    if p1 and p2 and p3:
-        m1 = re.search(r"\d+", p1.get_text())
-        m2 = re.search(r"\d+", p2.get_text())
-        m3 = re.search(r"\d+", p3.get_text())
-        if m1 and m2 and m3:
-            h, d, a = int(m1.group()), int(m2.group()), int(m3.group())
+def extract_probabilities_from_container(container):
+    # 1. Target dedicated outcome percentage elements (.fprt or forebet_p1/p2/p3)
+    fprt_elements = container.select(".fprt, .forebet_p1, .forebet_p2, .forebet_p3, [class*='prob']")
+    if fprt_elements:
+        combined_text = " ".join([el.get_text(" ", strip=True) for el in fprt_elements])
+        numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", combined_text)]
+        for i in range(len(numbers) - 2):
+            h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
             if 90 <= (h + d + a) <= 110:
                 return h, d, a
 
-    # 2. Extract from designated probability elements
-    prob_elements = row.select(".tr_probabilities, .predict-probabilities, .fprt, .fprmnt, [class*='prob']")
-    if prob_elements:
-        combined_text = " ".join([el.get_text(" ", strip=True) for el in prob_elements])
-        nums = [int(n) for n in re.findall(r"\b\d{1,3}\b", combined_text)]
-        for i in range(len(nums) - 2):
-            h, d, a = nums[i], nums[i + 1], nums[i + 2]
-            if 90 <= (h + d + a) <= 110:
-                return h, d, a
-
-    # 3. Fallback: Parse row text with metadata/team names removed
-    row_copy = BeautifulSoup(str(row), "html.parser")
-    for noisy_selector in [
+    # 2. Fallback: Strip non-probability elements and parse clean numerical content
+    clean_copy = BeautifulSoup(str(container), "html.parser")
+    for tag_name in [
         ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
         ".forebet_odds", "[class*='odds']", ".l_score", "[class*='score']",
-        ".st-time", "[class*='time']", ".date", "[class*='date']"
+        ".st-time", "[class*='time']", ".date", "[class*='date']", "a"
     ]:
-        for tag in row_copy.select(noisy_selector):
+        for tag in clean_copy.select(tag_name):
             tag.decompose()
 
-    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", row_copy.get_text(" ", strip=True))]
+    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", clean_copy.get_text(" ", strip=True))]
     for i in range(len(numbers) - 2):
         h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
         if 90 <= (h + d + a) <= 110:
@@ -172,24 +169,28 @@ def scrape_forebet(target_day):
     soup = BeautifulSoup(html_content, "html.parser")
 
     home_elements = soup.select(".homeTeam, [class*='homeTeam']")
+    raw_detected_count = len(home_elements)
 
     results = []
     seen_matches = set()
     validated_count = 0
 
     for home_el in home_elements:
-        # Ascend DOM until finding the ancestor row containing BOTH awayTeam and probabilities
+        # Ascend DOM until finding nearest parent containing awayTeam, probabilities, and only 1 match
         curr = home_el.parent
         row_container = None
         probabilities = None
 
         while curr and curr.name not in ["html", "body"]:
-            if curr.select_one(".awayTeam, [class*='awayTeam']"):
-                probs = get_probabilities(curr)
-                if probs is not None:
-                    row_container = curr
-                    probabilities = probs
-                    break
+            away_el = curr.select_one(".awayTeam, [class*='awayTeam']")
+            if away_el:
+                homes_in_curr = curr.select(".homeTeam, [class*='homeTeam']")
+                if len(homes_in_curr) == 1:
+                    probs = extract_probabilities_from_container(curr)
+                    if probs is not None:
+                        row_container = curr
+                        probabilities = probs
+                        break
             curr = curr.parent
 
         if not row_container or probabilities is None:
@@ -234,7 +235,7 @@ def scrape_forebet(target_day):
         )
 
     stats = {
-        "raw_detected": len(home_elements),
+        "raw_detected": raw_detected_count,
         "validated_parsed": validated_count,
         "selected_picks": len(results),
     }
