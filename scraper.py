@@ -72,7 +72,7 @@ async def fetch_full_html(url):
         print(f"Navigating to URL: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        print("Scrolling full page to load all matches dynamically...")
+        print("Scrolling full page to load all dynamic content...")
         previous_height = 0
         for step in range(15):
             current_height = await page.evaluate("document.body.scrollHeight")
@@ -88,13 +88,29 @@ async def fetch_full_html(url):
 
 
 def get_probabilities(row):
-    # Search specifically inside probability containers first to avoid odds/time digit interference
-    prob_container = row.select_one(".tr_probabilities, .predict-probabilities, [class*='prob']")
-    search_text = prob_container.get_text(" ", strip=True) if prob_container else row.get_text(" ", strip=True)
+    # 1. Direct target of Forebet probability elements if available
+    p1 = row.select_one(".forebet_p1, [class*='p1']")
+    p2 = row.select_one(".forebet_p2, [class*='p2']")
+    p3 = row.select_one(".forebet_p3, [class*='p3']")
 
-    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", search_text)]
+    if p1 and p2 and p3:
+        try:
+            h = int(re.search(r"\d+", p1.get_text()).group())
+            d = int(re.search(r"\d+", p2.get_text()).group())
+            a = int(re.search(r"\d+", p3.get_text()).group())
+            if 90 <= (h + d + a) <= 110:
+                return h, d, a
+        except (ValueError, AttributeError):
+            pass
 
-    # Sliding window to locate 3 consecutive numbers summing to ~100%
+    # 2. Fallback: Strip team names from row copy to prevent digits in team names (e.g. "Mainz 05") from skewing calculations
+    row_copy = BeautifulSoup(str(row), "html.parser")
+    for team_tag in row_copy.select(".homeTeam, .awayTeam, [class*='homeTeam'], [class*='awayTeam']"):
+        team_tag.decompose()
+
+    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", row_copy.get_text(" ", strip=True))]
+
+    # Find 3 consecutive numbers summing to ~100%
     for i in range(len(numbers) - 2):
         h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
         if 90 <= (h + d + a) <= 110:
@@ -117,22 +133,21 @@ def scrape_forebet(target_day):
     html_content = asyncio.run(fetch_full_html(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Locate individual match rows by finding homeTeam nodes and resolving their single-match parent row
-    home_nodes = soup.select(".homeTeam, [class*='homeTeam']")
+    home_elements = soup.select(".homeTeam, [class*='homeTeam']")
     match_rows = []
 
-    for home_el in home_nodes:
-        # Find closest ancestor containing awayTeam
-        parent = home_el.find_parent(
-            lambda tag: tag.select_one(".awayTeam, [class*='awayTeam']") is not None
-            and tag.name not in ["html", "body"]
+    for home_el in home_elements:
+        # Stop at the immediate parent row tag (tr, div, or li) containing awayTeam
+        row = home_el.find_parent(
+            lambda tag: tag.name in ["tr", "div", "li"]
+            and tag.select_one(".awayTeam, [class*='awayTeam']") is not None
         )
-        if parent and parent not in match_rows:
-            # Ensure ancestor is an individual match row (contains only 1 homeTeam element)
-            if len(parent.select(".homeTeam, [class*='homeTeam']")) == 1:
-                match_rows.append(parent)
+        if row and row not in match_rows:
+            # Confirm element is a single row wrapper
+            if len(row.select(".homeTeam, [class*='homeTeam']")) == 1:
+                match_rows.append(row)
 
-    print(f"Total isolated match rows detected: {len(match_rows)}")
+    print(f"Total match rows parsed: {len(match_rows)}")
 
     results = []
     seen_matches = set()
