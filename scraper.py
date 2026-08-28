@@ -17,27 +17,41 @@ MINIMUM_PROBABILITY = 75
 
 
 def fetch_html(url):
-    # Method 1: Cloudscraper browser session
+    # Method 1: Direct fetch via Cloudscraper
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
-        response = scraper.get(url, timeout=25)
+        response = scraper.get(url, timeout=15)
         if response.status_code == 200 and "rcnt" in response.text:
             print("Direct fetch via Cloudscraper succeeded.")
             return response.text
     except Exception as e:
-        print(f"Cloudscraper direct fetch attempted but failed: {e}")
+        print(f"Direct Cloudscraper fetch failed: {e}")
 
-    # Method 2: Route through Google Proxy (Bypasses Datacenter IP Blocks)
-    print("Switching to Google Proxy fetcher...")
-    proxy_url = f"https://translate.google.com/translate?sl=en&tl=en&u={url}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-    response = requests.get(proxy_url, headers=headers, timeout=25)
-    response.raise_for_status()
-    return response.text
+    # Method 2: AllOrigins raw HTML proxy
+    try:
+        print("Switching to AllOrigins Proxy...")
+        proxy_url = f"https://api.allorigins.win/raw?url={url}"
+        response = requests.get(proxy_url, timeout=20)
+        if response.status_code == 200 and len(response.text) > 5000:
+            print("AllOrigins proxy fetch succeeded.")
+            return response.text
+    except Exception as e:
+        print(f"AllOrigins proxy failed: {e}")
+
+    # Method 3: CodeTabs raw HTML proxy
+    try:
+        print("Switching to CodeTabs Proxy...")
+        proxy_url = f"https://api.codetabs.com/v1/proxy?quest={url}"
+        response = requests.get(proxy_url, timeout=20)
+        if response.status_code == 200 and len(response.text) > 5000:
+            print("CodeTabs proxy fetch succeeded.")
+            return response.text
+    except Exception as e:
+        print(f"CodeTabs proxy failed: {e}")
+
+    raise RuntimeError("All connection methods (Direct & Proxies) failed to retrieve page content.")
 
 
 def numbers_in_text(text):
@@ -89,7 +103,7 @@ def scrape_forebet(target_day):
         "tr.schema-row"
     )
 
-    print(f"Potential match rows found: {len(rows)}")
+    print(f"Match rows detected: {len(rows)}")
 
     results = []
     seen_matches = set()
@@ -180,4 +194,4 @@ if __name__ == "__main__":
         message = f"No matches found for {target_day.upper()} matching ≥ {MINIMUM_PROBABILITY}% probability criteria."
 
     send_telegram_message(message)
-    print(f"Telegram message sent. Total matches: {len(picks)}")
+    print(f"Telegram message sent. Total matches selected: {len(picks)}")
