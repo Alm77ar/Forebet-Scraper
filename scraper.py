@@ -1,9 +1,11 @@
 import os
 import re
 import sys
-import time
+import asyncio
 import requests
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -17,75 +19,90 @@ TARGET_URLS = {
 MINIMUM_PROBABILITY = 75
 
 
-def fetch_html_flaresolverr(url):
-    session_id = f"forebet_session_{int(time.time())}"
-    
-    # 1. Create FlareSolverr Session
-    try:
-        requests.post(
-            FLARESOLVERR_URL,
-            json={"cmd": "sessions.create", "session": session_id},
-            timeout=30,
-        )
-    except Exception as e:
-        print(f"Session creation warning: {e}")
-
-    # 2. Execute GET Request through Session
+def get_flaresolverr_clearance(url):
+    """Obtains Cloudflare cookies and User-Agent using FlareSolverr."""
     payload = {
         "cmd": "request.get",
         "url": url,
-        "session": session_id,
-        "maxTimeout": 300000,
+        "maxTimeout": 60000,
     }
     headers = {"Content-Type": "application/json"}
-
-    print(f"Sending request to FlareSolverr for: {url}")
-    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=310)
+    
+    print(f"Requesting Cloudflare clearance via FlareSolverr for: {url}")
+    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
     response.raise_for_status()
 
     data = response.json()
-
-    # 3. Destroy Session
-    try:
-        requests.post(
-            FLARESOLVERR_URL,
-            json={"cmd": "sessions.destroy", "session": session_id},
-            timeout=15,
-        )
-    except Exception:
-        pass
-
     if data.get("status") == "ok":
-        print("FlareSolverr successfully bypassed Cloudflare.")
-        return data["solution"]["response"]
+        solution = data["solution"]
+        return solution.get("cookies", []), solution.get("userAgent", "")
 
-    raise RuntimeError(f"FlareSolverr error: {data.get('message')}")
+    raise RuntimeError(f"FlareSolverr failed: {data.get('message')}")
 
 
-def numbers_in_text(text):
-    return [
-        int(value)
-        for value in re.findall(r"(?<![\d.])(\d{1,3})(?![\d.])", text)
-    ]
+async def fetch_full_html(url):
+    """Uses Playwright injected with FlareSolverr cookies to scroll and load all matches."""
+    cookies, user_agent = get_flaresolverr_clearance(url)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        )
+
+        pw_cookies = []
+        for c in cookies:
+            cookie_dict = {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c["domain"],
+                "path": c.get("path", "/"),
+            }
+            pw_cookies.append(cookie_dict)
+
+        context = await browser.new_context(
+            user_agent=user_agent,
+            viewport={"width": 1280, "height": 800},
+        )
+        await context.add_cookies(pw_cookies)
+
+        page = await context.new_page()
+        await stealth_async(page)
+
+        print(f"Navigating with authenticated session to: {url}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+        # Scroll to bottom in increments to trigger dynamic lazy loading
+        print("Scrolling full page to load all matches...")
+        for _ in range(12):
+            await page.evaluate("window.scrollBy(0, 2500)")
+            await page.wait_for_timeout(1000)
+
+        content = await page.content()
+        await browser.close()
+        return content
 
 
 def get_probabilities(row):
-    containers = row.select(
-        ".tr_probabilities, "
-        "[class*='probabilities'], "
-        "[class*='probability'], "
-        "[class*='prob']"
+    """Extracts probabilities using a sliding window to handle extra digits in row text."""
+    prob_element = row.select_one(".fprt, .tr_probabilities, [class*='prob']")
+    search_text = (
+        prob_element.get_text(" ", strip=True)
+        if prob_element
+        else row.get_text(" ", strip=True)
     )
 
-    for container in containers:
-        values = numbers_in_text(container.get_text(" ", strip=True))
-        if len(values) == 3 and 95 <= sum(values) <= 105:
-            return values[0], values[1], values[2]
+    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", search_text)]
 
-    for element in row.find_all(["div", "span", "td"]):
-        values = numbers_in_text(element.get_text(" ", strip=True))
-        if len(values) == 3 and 95 <= sum(values) <= 105:
-            return values[0], values[1], values[2]
+    # Look for 3 consecutive numbers that sum to ~100%
+    for i in range(len(numbers) - 2):
+        h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
+        if 90 <= (h + d + a) <= 110:
+            return h, d, a
 
     return None
 
@@ -101,17 +118,14 @@ def get_coefficient(row):
 
 def scrape_forebet(target_day):
     url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
-    html_content = fetch_html_flaresolverr(url)
+    html_content = asyncio.run(fetch_full_html(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
     rows = soup.select(
-        "div.rcnt, "
-        "div[class*='rcnt'], "
-        ".schema-row, "
-        "tr.schema-row"
+        "div.rcnt, div[class*='rcnt'], .schema-row, tr.schema-row, tr[class*='schema']"
     )
 
-    print(f"Match rows detected: {len(rows)}")
+    print(f"Total match rows parsed from DOM: {len(rows)}")
 
     results = []
     seen_matches = set()
@@ -166,7 +180,9 @@ def scrape_forebet(target_day):
 
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets.")
+        raise RuntimeError(
+            "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets."
+        )
 
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
@@ -193,9 +209,15 @@ if __name__ == "__main__":
         ]
 
         for item in picks:
-            coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
+            coef_str = (
+                f"{item['coefficient']:.2f}"
+                if item["coefficient"] > 0
+                else "N/A"
+            )
             lines.append(f"• {item['home']} vs {item['away']}")
-            lines.append(f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n")
+            lines.append(
+                f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n"
+            )
 
         message = "\n".join(lines)
     else:
