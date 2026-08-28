@@ -35,6 +35,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Wait for FlareSolverr Readiness
+        run: |
+          echo "Waiting for FlareSolverr..."
+          until curl -s http://localhost:8191/ | grep -q "FlareSolverr"; do
+            sleep 2
+          done
+          echo "FlareSolverr is ready!"
+
       - name: Install dependencies
         run: pip install requests beautifulsoup4
 
