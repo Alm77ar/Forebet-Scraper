@@ -2,13 +2,15 @@ name: Forebet Daily Scraper
 
 on:
   schedule:
-    - cron: '0 7 * * *'
+    # 07:00 UTC = 10:00 AM in Saudi Arabia (UTC+3)
+    - cron: "0 7 * * *"
+
   workflow_dispatch:
     inputs:
       target_day:
-        description: 'Select Target Page'
+        description: "Select the matches page"
         required: true
-        default: 'today'
+        default: "today"
         type: choice
         options:
           - today
@@ -17,21 +19,21 @@ on:
 jobs:
   scrape-and-send:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install Dependencies
-        run: |
-          pip install requests beautifulsoup4
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
 
-      - name: Run Scraper Script
+      - name: Scrape Forebet and send Telegram message
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scraper.py ${{ github.event.inputs.target_day || 'today' }}
+        run: python -u scraper.py "${{ github.event.inputs.target_day || 'today' }}"
