@@ -1,9 +1,9 @@
 import os
 import re
 import sys
-
+import cloudscraper
+import requests
 from bs4 import BeautifulSoup
-from curl_cffi import requests
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -16,6 +16,30 @@ TARGET_URLS = {
 MINIMUM_PROBABILITY = 75
 
 
+def fetch_html(url):
+    # Method 1: Cloudscraper browser session
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        response = scraper.get(url, timeout=25)
+        if response.status_code == 200 and "rcnt" in response.text:
+            print("Direct fetch via Cloudscraper succeeded.")
+            return response.text
+    except Exception as e:
+        print(f"Cloudscraper direct fetch attempted but failed: {e}")
+
+    # Method 2: Route through Google Proxy (Bypasses Datacenter IP Blocks)
+    print("Switching to Google Proxy fetcher...")
+    proxy_url = f"https://translate.google.com/translate?sl=en&tl=en&u={url}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    response = requests.get(proxy_url, headers=headers, timeout=25)
+    response.raise_for_status()
+    return response.text
+
+
 def numbers_in_text(text):
     return [
         int(value)
@@ -24,10 +48,6 @@ def numbers_in_text(text):
 
 
 def get_probabilities(row):
-    """
-    Forebet values are ordered:
-    1 = home win, X = draw, 2 = away win.
-    """
     containers = row.select(
         ".tr_probabilities, "
         "[class*='probabilities'], "
@@ -37,14 +57,11 @@ def get_probabilities(row):
 
     for container in containers:
         values = numbers_in_text(container.get_text(" ", strip=True))
-
         if len(values) == 3 and 95 <= sum(values) <= 105:
             return values[0], values[1], values[2]
 
-    # Backup if Forebet changes the class name.
     for element in row.find_all(["div", "span", "td"]):
         values = numbers_in_text(element.get_text(" ", strip=True))
-
         if len(values) == 3 and 95 <= sum(values) <= 105:
             return values[0], values[1], values[2]
 
@@ -53,7 +70,6 @@ def get_probabilities(row):
 
 def get_coefficient(row):
     odds_element = row.select_one(".forebet_odds, [class*='odds']")
-
     if not odds_element:
         return 0.0
 
@@ -63,16 +79,8 @@ def get_coefficient(row):
 
 def scrape_forebet(target_day):
     url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
-
-    try:
-        # impersonate="chrome124" spoofs desktop browser TLS fingerprints to bypass 403 blocks
-        response = requests.get(url, impersonate="chrome124", timeout=30)
-        response.raise_for_status()
-
-    except Exception as error:
-        raise RuntimeError(f"Could not connect to Forebet: {error}") from error
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    html_content = fetch_html(url)
+    soup = BeautifulSoup(html_content, "html.parser")
 
     rows = soup.select(
         "div.rcnt, "
@@ -81,7 +89,7 @@ def scrape_forebet(target_day):
         "tr.schema-row"
     )
 
-    print(f"Potential Forebet match rows found: {len(rows)}")
+    print(f"Potential match rows found: {len(rows)}")
 
     results = []
     seen_matches = set()
@@ -95,41 +103,34 @@ def scrape_forebet(target_day):
 
         home_team = home_element.get_text(" ", strip=True)
         away_team = away_element.get_text(" ", strip=True)
-
         probabilities = get_probabilities(row)
 
         if not home_team or not away_team or probabilities is None:
             continue
 
-        home_probability, draw_probability, away_probability = probabilities
+        home_prob, draw_prob, away_prob = probabilities
 
-        # Only check 1 (home) and 2 (away). Ignore X (draw).
-        if (
-            home_probability < MINIMUM_PROBABILITY
-            and away_probability < MINIMUM_PROBABILITY
-        ):
+        if home_prob < MINIMUM_PROBABILITY and away_prob < MINIMUM_PROBABILITY:
             continue
 
-        if home_probability >= away_probability:
+        if home_prob >= away_prob:
             pick = "1 — Home win"
-            probability = home_probability
+            prob = home_prob
         else:
             pick = "2 — Away win"
-            probability = away_probability
+            prob = away_prob
 
         match_key = (home_team, away_team)
-
         if match_key in seen_matches:
             continue
 
         seen_matches.add(match_key)
-
         results.append(
             {
                 "home": home_team,
                 "away": away_team,
                 "pick": pick,
-                "probability": probability,
+                "probability": prob,
                 "coefficient": get_coefficient(row),
             }
         )
@@ -143,19 +144,14 @@ def scrape_forebet(target_day):
 
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets."
-        )
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets.")
 
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     for start in range(0, len(message), 4000):
         response = requests.post(
             telegram_url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message[start:start + 4000],
-            },
+            json={"chat_id": CHAT_ID, "text": message[start : start + 4000]},
             timeout=30,
         )
         response.raise_for_status()
@@ -163,7 +159,6 @@ def send_telegram_message(message):
 
 if __name__ == "__main__":
     target_day = sys.argv[1].lower() if len(sys.argv) > 1 else "today"
-
     if target_day not in TARGET_URLS:
         target_day = "today"
 
@@ -172,30 +167,17 @@ if __name__ == "__main__":
     if picks:
         lines = [
             f"⚽ Forebet picks for {target_day.upper()}",
-            f"Filter: column 1 or 2 must be at least {MINIMUM_PROBABILITY}%",
-            "",
+            f"Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%\n",
         ]
 
         for item in picks:
-            coefficient = (
-                f"{item['coefficient']:.2f}"
-                if item["coefficient"] > 0
-                else "N/A"
-            )
-
+            coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
             lines.append(f"• {item['home']} vs {item['away']}")
-            lines.append(
-                f"  Pick: {item['pick']} "
-                f"({item['probability']}%) | COEF: {coefficient}"
-            )
-            lines.append("")
+            lines.append(f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n")
 
         message = "\n".join(lines)
     else:
-        message = (
-            f"No matches found for {target_day.upper()} where "
-            f"column 1 or 2 is at least {MINIMUM_PROBABILITY}%."
-        )
+        message = f"No matches found for {target_day.upper()} matching ≥ {MINIMUM_PROBABILITY}% probability criteria."
 
     send_telegram_message(message)
-    print(f"Telegram message sent. Matches selected: {len(picks)}")
+    print(f"Telegram message sent. Total matches: {len(picks)}")
