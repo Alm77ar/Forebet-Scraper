@@ -1,72 +1,118 @@
 import os
+import sys
+import asyncio
+from playwright.async_api import async_playwright
 import requests
-from bs4 import BeautifulSoup
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-URL = "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow"
 
-def get_forebet_top_picks():
-    # User-Agent header is required to bypass default scraper blocks
-        headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    }
-                        
-                            response = requests.get(URL, headers=headers)
-                                soup = BeautifulSoup(response.text, "html.parser")
-                                    
-                                        # Rows containing match predictions
-                                            match_rows = soup.find_all("div", class_="rcnttr")
-                                                top_picks = []
+# Dynamic page mapping
+TARGET_URLS = {
+    "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today",
+    "tomorrow": "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow"
+}
 
-                                                    for row in match_rows:
-                                                            try:
-                                                                        # Extract Team Names
-                                                                                    home_team = row.find("span", class_="homeTeam").text.strip()
-                                                                                                away_team = row.find("span", class_="awayTeam").text.strip()
-                                                                                                            
-                                                                                                                        # Extract Win Probabilities (1 X 2)
-                                                                                                                                    prob_spans = row.find("div", class_="tr_probabilities").find_all("span")
-                                                                                                                                                p_home = float(prob_spans[0].text.strip())
-                                                                                                                                                            p_draw = float(prob_spans[1].text.strip())
-                                                                                                                                                                        p_away = float(prob_spans[2].text.strip())
+async def scrape_forebet(target_day: str):
+    url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
+    results = []
 
-                                                                                                                                                                                    # Check criteria: Either Home >= 75% or Away >= 75%
-                                                                                                                                                                                                if 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
-                                                                                                                                                                                                                                                                                                # Extract Odds / COEF
-                                                                                                                                                                                                                                                                                                                                                if odds_elem:
-                                                                                                                                                                                                                                                                                                                                                                    odd_text = odds_elem.text.strip().split()[0] # Grab first odds entry
-                                                                                                                                                                                                                                                                                                                                                                                        try:
-                                                                                                                                                                                                                                                                                                                                                                                                                odds_val = float(odds_text)
-                                                                                                                                                                                                                                                                                                                                                                                                                                    except ValueError:
-                                                                                                                                                                                                                                                                                                                                                                                                                                                            odds_val = 0.0
+    async with async_playwright() as p:
+        # Launch headless Chromium browser to pass JavaScript checks
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                            top_picks.append({
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                "home": home_team,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "away": away_team,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "pick": picked_side,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            "prob": highest_prob,
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                "coef": odds_val
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                })
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        except Exception:
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    # Skip rows missing necessary fields (e.g. ad banners or postponed matches)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                continue
+        # Navigate and wait for row predictions to load fully
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector(".rcnttr", timeout=15000)
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    # Sort descending by COEF (highest odds first)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        top_picks.sort(key=lambda x: x["coef"], reverse=True)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            return top_picks
+        # Extract rows
+        rows = await page.query_selector_all(".rcnttr")
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            def send_telegram_message(message):
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        # Break into chunks if message exceeds Telegram limit (4096 chars)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            if len(message) > 4000:
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    for i in range(0, len(message), 4000):
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                payload = {"chat_id": CHAT_ID, "text": message[i:i+4000], "parse_mode": "Markdown"}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            requests.post(telegram_url, json=payload)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                else:
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                requests.post(telegram_url, json=payload)
+        for row in rows:
+            try:
+                # Teams
+                home_elem = await row.query_selector(".homeTeam")
+                away_elem = await row.query_selector(".awayTeam")
+                if not home_elem or not away_elem:
+                    continue
+                home_team = (await home_elem.inner_text()).strip()
+                away_team = (await away_elem.inner_text()).strip()
 
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                if 
+                # Probabilities (1 X 2)
+                prob_spans = await row.query_selector_all(".tr_probabilities span")
+                if len(prob_spans) < 3:
+                    continue
+                
+                p_home = float((await prob_spans[0].inner_text()).strip())
+                p_away = float((await prob_spans[2].inner_text()).strip())
+
+                # Criteria: Either Home or Away >= 75%
+                if p_home >= 75.0 or p_away >= 75.0:
+                    picked_side = "Home (1)" if p_home >= 75.0 else "Away (2)"
+                    highest_prob = p_home if p_home >= 75.0 else p_away
+
+                    # COEF (Odds)
+                    odds_elem = await row.query_selector(".forebet_odds")
+                    coef_val = 0.0
+                    if odds_elem:
+                        raw_odds = (await odds_elem.inner_text()).strip().split()
+                        if raw_odds:
+                            try:
+                                coef_val = float(raw_odds[0])
+                            except ValueError:
+                                coef_val = 0.0
+
+                    results.append({
+                        "home": home_team,
+                        "away": away_team,
+                        "pick": picked_side,
+                        "prob": highest_prob,
+                        "coef": coef_val
+                    })
+            except Exception:
+                continue
+
+        await browser.close()
+
+    # Sort descending by COEF (highest odds top)
+    results.sort(key=lambda x: x["coef"], reverse=True)
+    return results
+
+def send_telegram_message(message: str):
+    telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    
+    # Message splitting if exceeding Telegram character limits
+    if len(message) > 4000:
+        for i in range(0, len(message), 4000):
+            payload = {"chat_id": CHAT_ID, "text": message[i:i+4000], "parse_mode": "Markdown"}
+            requests.post(telegram_url, json=payload)
+    else:
+        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(telegram_url, json=payload)
+
+if __name__ == "__main__":
+    # Command argument input: 'today' or 'tomorrow' (default: today)
+    target_day = sys.argv[1].lower() if len(sys.argv) > 1 else "today"
+    if target_day not in ["today", "tomorrow"]:
+        target_day = "today"
+
+    picks = asyncio.run(scrape_forebet(target_day))
+    day_label = target_day.upper()
+
+    if picks:
+        lines = [f"⚽ *Forebet Matches for {day_label} (≥ 75% Prob sorted by COEF)*\n"]
+        for item in picks:
+            coef_str = f"{item['coef']:.2f}" if item['coef'] > 0 else "N/A"
+            lines.append(
+                f"• *{item['home']} vs {item['away']}*\n"
+                f"  📊 Pick: *{item['pick']}* ({item['prob']}%) | 📈 COEF: *{coef_str}*\n"
+            )
+        msg = "\n".join(lines)
+    else:
+        msg = f"ℹ️ No matches found for *{day_label}* meeting the ≥ 75% probability criteria."
+
+    send_telegram_message(msg)
