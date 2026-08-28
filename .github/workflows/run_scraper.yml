@@ -19,6 +19,7 @@ on:
 jobs:
   scrape-and-send:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # Overall job timeout (default is 360 mins)
 
     steps:
       - name: Checkout repository
@@ -35,6 +36,7 @@ jobs:
           playwright install chromium
 
       - name: Scrape Forebet and send Telegram message
+        timeout-minutes: 10 # Gives Python & Playwright up to 10 minutes to finish reading the page
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
