@@ -45,7 +45,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright playwright-stealth beautifulsoup4 requests
+          pip install playwright beautifulsoup4 requests
           playwright install chromium
 
       - name: Scrape Forebet and send Telegram message
