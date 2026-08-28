@@ -2,7 +2,6 @@ import os
 import re
 import sys
 import asyncio
-import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from playwright_stealth import stealth_async
@@ -20,42 +19,30 @@ MINIMUM_PROBABILITY = 75
 
 async def fetch_html_playwright(url):
     async with async_playwright() as p:
+        # Launch Chromium with stealth flags
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-            ],
+            ]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 800}
         )
         page = await context.new_page()
         await stealth_async(page)
 
         print(f"Navigating to: {url}")
-        # Primary navigation timeout set to 90 seconds
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # Wait up to 30s for the initial prediction table wrappers
+        # Wait up to 15s for Cloudflare challenge to pass or match rows to render
         try:
-            await page.wait_for_selector(
-                ".rcnt, div[class*='rcnt'], .schema-row, tr[class*='schema']",
-                timeout=30000,
-            )
+            await page.wait_for_selector(".rcnt, div[class*='rcnt'], .schema-row", timeout=15000)
         except Exception:
-            print("Selector wait timed out, continuing with loaded DOM...")
-
-        # Incremental scrolling to trigger all lazy-loaded rows
-        print("Scrolling page to force all matches to render...")
-        for _ in range(8):
-            await page.evaluate("window.scrollBy(0, 2000)")
-            await page.wait_for_timeout(1000)
-
-        # Brief pause to allow background dynamic AJAX requests to finalize
-        await page.wait_for_timeout(2000)
+            print("Selector wait timed out, attempting content extraction anyway...")
 
         content = await page.content()
         await browser.close()
@@ -79,12 +66,12 @@ def get_probabilities(row):
 
     for container in containers:
         values = numbers_in_text(container.get_text(" ", strip=True))
-        if len(values) == 3 and 90 <= sum(values) <= 110:
+        if len(values) == 3 and 95 <= sum(values) <= 105:
             return values[0], values[1], values[2]
 
     for element in row.find_all(["div", "span", "td"]):
         values = numbers_in_text(element.get_text(" ", strip=True))
-        if len(values) == 3 and 90 <= sum(values) <= 110:
+        if len(values) == 3 and 95 <= sum(values) <= 105:
             return values[0], values[1], values[2]
 
     return None
@@ -104,17 +91,14 @@ def scrape_forebet(target_day):
     html_content = asyncio.run(fetch_html_playwright(url))
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Expanded selector query to catch secondary/minor league match wrappers
     rows = soup.select(
         "div.rcnt, "
         "div[class*='rcnt'], "
         ".schema-row, "
-        "tr.schema-row, "
-        "tr[class*='schema'], "
-        "div[class*='schema']"
+        "tr.schema-row"
     )
 
-    print(f"Total raw match rows detected: {len(rows)}")
+    print(f"Match rows detected: {len(rows)}")
 
     results = []
     seen_matches = set()
@@ -168,6 +152,7 @@ def scrape_forebet(target_day):
 
 
 def send_telegram_message(message):
+    import requests
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID GitHub secrets.")
 
