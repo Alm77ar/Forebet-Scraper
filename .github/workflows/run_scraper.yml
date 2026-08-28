@@ -47,6 +47,7 @@ jobs:
         run: pip install requests beautifulsoup4
 
       - name: Scrape Forebet and send Telegram message
+        timeout-minutes: 10
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
