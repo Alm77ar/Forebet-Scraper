@@ -2,8 +2,8 @@ import os
 import re
 import sys
 
-import requests
 from bs4 import BeautifulSoup
+from curl_cffi import requests
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -14,16 +14,6 @@ TARGET_URLS = {
 }
 
 MINIMUM_PROBABILITY = 75
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
 
 
 def numbers_in_text(text):
@@ -75,19 +65,11 @@ def scrape_forebet(target_day):
     url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
 
     try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
+        # impersonate="chrome124" spoofs desktop browser TLS fingerprints to bypass 403 blocks
+        response = requests.get(url, impersonate="chrome124", timeout=30)
         response.raise_for_status()
 
-    except requests.HTTPError as error:
-        if error.response is not None and error.response.status_code == 403:
-            raise RuntimeError(
-                "Forebet blocked this computer or server (HTTP 403). "
-                "GitHub Actions cannot access the page from its hosted server."
-            ) from error
-
-        raise RuntimeError(f"Forebet returned an error: {error}") from error
-
-    except requests.RequestException as error:
+    except Exception as error:
         raise RuntimeError(f"Could not connect to Forebet: {error}") from error
 
     soup = BeautifulSoup(response.text, "html.parser")
