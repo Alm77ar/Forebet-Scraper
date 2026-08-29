@@ -515,7 +515,7 @@ if __name__ == "__main__":
     picks, stats = scrape_forebet(target_day)
 
     lines = [
-        f"⚽ <b>Forebet picks for {target_day.upper()}</b>",
+        f"⚽ <b> picks for {target_day.upper()}</b>",
         f"<i>Filter: Win probability ≥ {MINIMUM_PROBABILITY}%</i>\n",
     ]
 
