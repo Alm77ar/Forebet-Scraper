@@ -1,354 +1,67 @@
-import os
-import re
-import sys
-import asyncio
-import requests
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
-
-TARGET_URLS = {
-    "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today",
-    "tomorrow": "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow",
-}
-
-MINIMUM_PROBABILITY = 75
-
-# --- Tunables pulled out so they're easy to bump without hunting through the code ---
-HYDRATION_TIMEOUT_MS = 40000       # was 20000 - give slow AJAX more room
-MAX_SCROLL_STEPS = 45              # was 30 - more room to reach the bottom
-SCROLL_PAUSE_MS = 700              # was 600 - slightly gentler pacing
-STAGNATION_STEPS_REQUIRED = 10     # was 5 - don't bail on a brief lull
-DEBUG_DIR = "debug_artifacts"
-
-
-def get_flaresolverr_clearance(url):
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "maxTimeout": 60000,
-    }
-    headers = {"Content-Type": "application/json"}
-
-    print(f"Requesting Cloudflare clearance via FlareSolverr: {url}")
-    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
-    response.raise_for_status()
-
-    data = response.json()
-    if data.get("status") == "ok":
-        solution = data["solution"]
-        return solution.get("cookies", []), solution.get("userAgent", "")
-
-    raise RuntimeError(f"FlareSolverr clearance failed: {data.get('message')}")
-
-
-async def click_all_more_buttons(page):
-    """
-    Click EVERY visible 'load more' / pagination control on the page, not just
-    the first one. Sites that group matches by league often render one such
-    control per section, so query_selector (singular) silently misses all but
-    the first section's button.
-    """
-    clicked = 0
-    buttons = await page.query_selector_all(
-        "#btn_more, .schema-more, a[id*='more'], button[id*='more'], "
-        "[class*='show-more'], [class*='loadMore'], [class*='load-more']"
-    )
-    for btn in buttons:
-        try:
-            if await btn.is_visible():
-                await btn.click(timeout=2000)
-                clicked += 1
-                await page.wait_for_timeout(400)
-        except Exception:
-            # Button may have detached from DOM after a previous click re-rendered
-            # the list; that's fine, just move on to the next one.
-            continue
-    return clicked
-
-
-async def fetch_full_html(url, run_label="run"):
-    cookies, user_agent = get_flaresolverr_clearance(url)
-
-    os.makedirs(DEBUG_DIR, exist_ok=True)
-    step_counts = []
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-
-        pw_cookies = [
-            {
-                "name": c["name"],
-                "value": c["value"],
-                "domain": c["domain"],
-                "path": c.get("path", "/"),
-            }
-            for c in cookies
-        ]
-
-        context = await browser.new_context(
-            user_agent=user_agent,
-            viewport={"width": 1440, "height": 900},
-        )
-        await context.add_cookies(pw_cookies)
-
-        # Mask automation footprint to allow sub-resource AJAX calls through Cloudflare
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-
-        page = await context.new_page()
-
-        print(f"Navigating to match table: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-
-        # Save what the page looked like immediately after the initial clearance-backed
-        # load, before any of our own scrolling/clicking. If Cloudflare is soft-blocking
-        # the hydration AJAX calls, this snapshot will already look "stuck".
-        await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_00_initial.png", full_page=True)
-
-        # Wait for dynamic matches to hydrate into the DOM
-        try:
-            await page.wait_for_function(
-                "document.querySelectorAll('.homeTeam, [class*=\"homeTeam\"]').length > 10",
-                timeout=HYDRATION_TIMEOUT_MS,
-            )
-            print("Match list hydrated successfully.")
-        except Exception:
-            print("Warning: Initial hydration timeout reached. Continuing with incremental scroll...")
-
-        # Incremental step scroll to trigger IntersectionObserver and scroll listeners
-        print("Executing incremental step scrolling...")
-        last_count = 0
-        stagnant_steps = 0
-
-        for step in range(MAX_SCROLL_STEPS):
-            await page.evaluate("window.scrollBy(0, 800);")
-            await page.wait_for_timeout(SCROLL_PAUSE_MS)
-
-            clicked = await click_all_more_buttons(page)
-
-            current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
-            step_counts.append(current_count)
-
-            # Per-step diagnostic logging so a stalled run is easy to diagnose
-            # from the Action logs alone, without needing to reproduce locally.
-            print(
-                f"  step {step:02d}: matches_detected={current_count} "
-                f"more_buttons_clicked={clicked} stagnant_steps={stagnant_steps}"
-            )
-
-            if current_count == last_count and current_count > 15:
-                stagnant_steps += 1
-                if stagnant_steps >= STAGNATION_STEPS_REQUIRED:
-                    print(f"Scroll complete: Captured {current_count} matches "
-                          f"(stagnant for {STAGNATION_STEPS_REQUIRED} steps).")
-                    break
-            else:
-                stagnant_steps = 0
-                last_count = current_count
-        else:
-            print(f"Reached MAX_SCROLL_STEPS ({MAX_SCROLL_STEPS}) without full stagnation; "
-                  f"stopping with {last_count} matches. Consider raising MAX_SCROLL_STEPS "
-                  f"if this happens consistently.")
-
-        # Final snapshot + raw HTML, saved regardless of outcome, so every run leaves
-        # a trail you can inspect after the fact via the workflow's uploaded artifact.
-        await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=True)
-        content = await page.content()
-        with open(f"{DEBUG_DIR}/{run_label}_final.html", "w", encoding="utf-8") as f:
-            f.write(content)
-        with open(f"{DEBUG_DIR}/{run_label}_step_counts.txt", "w") as f:
-            f.write("step,matches_detected\n")
-            for i, c in enumerate(step_counts):
-                f.write(f"{i},{c}\n")
-
-        await browser.close()
-        return content
-
-
-def extract_probabilities_from_container(container):
-    # 1. Target dedicated outcome percentage elements (.fprt or forebet_p1/p2/p3)
-    fprt_elements = container.select(".fprt, .forebet_p1, .forebet_p2, .forebet_p3, [class*='prob']")
-    if fprt_elements:
-        combined_text = " ".join([el.get_text(" ", strip=True) for el in fprt_elements])
-        numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", combined_text)]
-        for i in range(len(numbers) - 2):
-            h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
-            if 90 <= (h + d + a) <= 110:
-                return h, d, a
-
-    # 2. Fallback: Strip non-probability elements and parse clean numerical content
-    clean_copy = BeautifulSoup(str(container), "html.parser")
-    for tag_name in [
-        ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
-        ".forebet_odds", "[class*='odds']", ".l_score", "[class*='score']",
-        ".st-time", "[class*='time']", ".date", "[class*='date']", "a"
-    ]:
-        for tag in clean_copy.select(tag_name):
-            tag.decompose()
-
-    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", clean_copy.get_text(" ", strip=True))]
-    for i in range(len(numbers) - 2):
-        h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
-        if 90 <= (h + d + a) <= 110:
-            return h, d, a
-
-    return None
-
-
-def get_coefficient(row):
-    odds_element = row.select_one(".forebet_odds, [class*='odds']")
-    if not odds_element:
-        return 0.0
-
-    match = re.search(r"\d+(?:\.\d+)?", odds_element.get_text(" ", strip=True))
-    return float(match.group()) if match else 0.0
-
-
-def scrape_forebet(target_day):
-    url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
-    html_content = asyncio.run(fetch_full_html(url, run_label=target_day))
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    home_elements = soup.select(".homeTeam, [class*='homeTeam']")
-    raw_detected_count = len(home_elements)
-
-    results = []
-    seen_matches = set()
-    validated_count = 0
-    skipped_no_container = 0
-
-    for home_el in home_elements:
-        # Ascend DOM until finding nearest parent containing awayTeam, probabilities, and only 1 match
-        curr = home_el.parent
-        row_container = None
-        probabilities = None
-
-        while curr and curr.name not in ["html", "body"]:
-            away_el = curr.select_one(".awayTeam, [class*='awayTeam']")
-            if away_el:
-                homes_in_curr = curr.select(".homeTeam, [class*='homeTeam']")
-                if len(homes_in_curr) == 1:
-                    probs = extract_probabilities_from_container(curr)
-                    if probs is not None:
-                        row_container = curr
-                        probabilities = probs
-                        break
-            curr = curr.parent
-
-        if not row_container or probabilities is None:
-            skipped_no_container += 1
-            continue
-
-        home_element = row_container.select_one(".homeTeam, [class*='homeTeam']")
-        away_element = row_container.select_one(".awayTeam, [class*='awayTeam']")
-
-        if not home_element or not away_element:
-            continue
-
-        home_team = home_element.get_text(" ", strip=True)
-        away_team = away_element.get_text(" ", strip=True)
-
-        match_key = (home_team, away_team)
-        if match_key in seen_matches:
-            continue
-
-        seen_matches.add(match_key)
-        validated_count += 1
-
-        home_prob, draw_prob, away_prob = probabilities
-
-        if home_prob < MINIMUM_PROBABILITY and away_prob < MINIMUM_PROBABILITY:
-            continue
-
-        if home_prob >= away_prob:
-            pick = "1 — Home win"
-            prob = home_prob
-        else:
-            pick = "2 — Away win"
-            prob = away_prob
-
-        results.append(
-            {
-                "home": home_team,
-                "away": away_team,
-                "pick": pick,
-                "probability": prob,
-                "coefficient": get_coefficient(row_container),
-            }
-        )
-
-    stats = {
-        "raw_detected": raw_detected_count,
-        "validated_parsed": validated_count,
-        "skipped_no_container": skipped_no_container,
-        "selected_picks": len(results),
-    }
-
-    sorted_results = sorted(
-        results,
-        key=lambda item: (item["probability"], item["coefficient"]),
-        reverse=True,
-    )
-
-    return sorted_results, stats
-
-
-def send_telegram_message(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables.")
-
-    telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    for start in range(0, len(message), 4000):
-        response = requests.post(
-            telegram_url,
-            json={"chat_id": CHAT_ID, "text": message[start : start + 4000]},
-            timeout=30,
-        )
-        response.raise_for_status()
-
-
-if __name__ == "__main__":
-    target_day = sys.argv[1].lower() if len(sys.argv) > 1 else "today"
-    if target_day not in TARGET_URLS:
-        target_day = "today"
-
-    picks, stats = scrape_forebet(target_day)
-
-    lines = [
-        f"⚽ Forebet picks for {target_day.upper()}",
-        f"Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%\n",
-    ]
-
-    if picks:
-        for item in picks:
-            coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
-            lines.append(f"• {item['home']} vs {item['away']}")
-            lines.append(f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n")
-    else:
-        lines.append("No matches found matching criteria.\n")
-
-    lines.append("---")
-    lines.append("📊 Validation Diagnostics:")
-    lines.append(f"• Match nodes detected in DOM: {stats['raw_detected']}")
-    lines.append(f"• Validated match rows parsed: {stats['validated_parsed']}")
-    lines.append(f"• Rows skipped (no valid container found): {stats['skipped_no_container']}")
-    lines.append(f"• Picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
-
-    message = "\n".join(lines)
-    send_telegram_message(message)
-    print("Telegram notification dispatched successfully.")
-    print(f"Debug artifacts (screenshots, final HTML, step-by-step counts) saved to ./{DEBUG_DIR}/")
+name: Forebet Daily Scraper
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+
+  workflow_dispatch:
+    inputs:
+      target_day:
+        description: "Select the matches page"
+        required: true
+        default: "today"
+        type: choice
+        options:
+          - today
+          - tomorrow
+
+jobs:
+  scrape-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+          - 8191:8191
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Wait for FlareSolverr Readiness
+        run: |
+          echo "Waiting for FlareSolverr..."
+          until curl -s http://localhost:8191/ | grep -q "FlareSolverr"; do
+            sleep 2
+          done
+          echo "FlareSolverr is ready!"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright beautifulsoup4 requests
+          playwright install chromium
+
+      - name: Scrape Forebet and send Telegram message
+        timeout-minutes: 15
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+        run: python -u scraper.py "${{ github.event.inputs.target_day || 'today' }}"
+
+      # Runs even if the scrape/send step above fails, so you can still inspect
+      # what the page looked like on a failed run, not just successful ones.
+      - name: Upload debug artifacts (screenshots, HTML, step counts)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forebet-debug-${{ github.run_id }}
+          path: debug_artifacts/
+          retention-days: 7
