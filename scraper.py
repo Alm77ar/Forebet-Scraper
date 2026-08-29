@@ -125,7 +125,12 @@ async def fetch_full_html(url, run_label="run"):
         # Save what the page looked like immediately after the initial clearance-backed
         # load, before any of our own scrolling/clicking. If Cloudflare is soft-blocking
         # the hydration AJAX calls, this snapshot will already look "stuck".
-        await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_00_initial.png", full_page=True)
+        # Wrapped in try/except: a debug screenshot failing (e.g. timing out on an
+        # unusually tall page) must never crash the actual scrape/send run.
+        try:
+            await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_00_initial.png", full_page=True, timeout=60000)
+        except Exception as e:
+            print(f"Warning: initial debug screenshot failed/timed out, continuing anyway: {e}")
 
         # Wait for dynamic matches to hydrate into the DOM
         try:
@@ -174,7 +179,21 @@ async def fetch_full_html(url, run_label="run"):
 
         # Final snapshot + raw HTML, saved regardless of outcome, so every run leaves
         # a trail you can inspect after the fact via the workflow's uploaded artifact.
-        await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=True)
+        # This is where the crash happened: a full-page screenshot on a page that has
+        # grown very tall (e.g. 1000+ matches after a real "load more" click) can take
+        # far longer than Playwright's default 30s timeout. Same try/except pattern as
+        # above - if it still fails even with the longer timeout, fall back to a
+        # viewport-only (non-full-page) screenshot instead of giving up entirely, and
+        # if even that fails, skip the screenshot rather than crash the whole run.
+        try:
+            await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=True, timeout=90000)
+        except Exception as e:
+            print(f"Warning: full-page final screenshot failed/timed out ({e}), trying viewport-only fallback...")
+            try:
+                await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=False, timeout=30000)
+            except Exception as e2:
+                print(f"Warning: viewport screenshot also failed, skipping final screenshot entirely: {e2}")
+
         content = await page.content()
         with open(f"{DEBUG_DIR}/{run_label}_final.html", "w", encoding="utf-8") as f:
             f.write(content)
