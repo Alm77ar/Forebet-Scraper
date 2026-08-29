@@ -17,6 +17,13 @@ TARGET_URLS = {
 
 MINIMUM_PROBABILITY = 75
 
+# --- Tunables pulled out so they're easy to bump without hunting through the code ---
+HYDRATION_TIMEOUT_MS = 40000       # was 20000 - give slow AJAX more room
+MAX_SCROLL_STEPS = 45              # was 30 - more room to reach the bottom
+SCROLL_PAUSE_MS = 700              # was 600 - slightly gentler pacing
+STAGNATION_STEPS_REQUIRED = 10     # was 5 - don't bail on a brief lull
+DEBUG_DIR = "debug_artifacts"
+
 
 def get_flaresolverr_clearance(url):
     payload = {
@@ -38,8 +45,36 @@ def get_flaresolverr_clearance(url):
     raise RuntimeError(f"FlareSolverr clearance failed: {data.get('message')}")
 
 
-async def fetch_full_html(url):
+async def click_all_more_buttons(page):
+    """
+    Click EVERY visible 'load more' / pagination control on the page, not just
+    the first one. Sites that group matches by league often render one such
+    control per section, so query_selector (singular) silently misses all but
+    the first section's button.
+    """
+    clicked = 0
+    buttons = await page.query_selector_all(
+        "#btn_more, .schema-more, a[id*='more'], button[id*='more'], "
+        "[class*='show-more'], [class*='loadMore'], [class*='load-more']"
+    )
+    for btn in buttons:
+        try:
+            if await btn.is_visible():
+                await btn.click(timeout=2000)
+                clicked += 1
+                await page.wait_for_timeout(400)
+        except Exception:
+            # Button may have detached from DOM after a previous click re-rendered
+            # the list; that's fine, just move on to the next one.
+            continue
+    return clicked
+
+
+async def fetch_full_html(url, run_label="run"):
     cookies, user_agent = get_flaresolverr_clearance(url)
+
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    step_counts = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -78,11 +113,16 @@ async def fetch_full_html(url):
         print(f"Navigating to match table: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
+        # Save what the page looked like immediately after the initial clearance-backed
+        # load, before any of our own scrolling/clicking. If Cloudflare is soft-blocking
+        # the hydration AJAX calls, this snapshot will already look "stuck".
+        await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_00_initial.png", full_page=True)
+
         # Wait for dynamic matches to hydrate into the DOM
         try:
             await page.wait_for_function(
                 "document.querySelectorAll('.homeTeam, [class*=\"homeTeam\"]').length > 10",
-                timeout=20000,
+                timeout=HYDRATION_TIMEOUT_MS,
             )
             print("Match list hydrated successfully.")
         except Exception:
@@ -93,33 +133,47 @@ async def fetch_full_html(url):
         last_count = 0
         stagnant_steps = 0
 
-        for step in range(30):
+        for step in range(MAX_SCROLL_STEPS):
             await page.evaluate("window.scrollBy(0, 800);")
-            await page.wait_for_timeout(600)
+            await page.wait_for_timeout(SCROLL_PAUSE_MS)
 
-            # Click any dynamic pagination or 'More' buttons if present
-            try:
-                more_btn = await page.query_selector(
-                    "#btn_more, .schema-more, a[id*='more'], button[id*='more']"
-                )
-                if more_btn and await more_btn.is_visible():
-                    await more_btn.click()
-                    await page.wait_for_timeout(1000)
-            except Exception:
-                pass
+            clicked = await click_all_more_buttons(page)
 
             current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
+            step_counts.append(current_count)
+
+            # Per-step diagnostic logging so a stalled run is easy to diagnose
+            # from the Action logs alone, without needing to reproduce locally.
+            print(
+                f"  step {step:02d}: matches_detected={current_count} "
+                f"more_buttons_clicked={clicked} stagnant_steps={stagnant_steps}"
+            )
 
             if current_count == last_count and current_count > 15:
                 stagnant_steps += 1
-                if stagnant_steps >= 5:
-                    print(f"Scroll complete: Captured {current_count} matches.")
+                if stagnant_steps >= STAGNATION_STEPS_REQUIRED:
+                    print(f"Scroll complete: Captured {current_count} matches "
+                          f"(stagnant for {STAGNATION_STEPS_REQUIRED} steps).")
                     break
             else:
                 stagnant_steps = 0
                 last_count = current_count
+        else:
+            print(f"Reached MAX_SCROLL_STEPS ({MAX_SCROLL_STEPS}) without full stagnation; "
+                  f"stopping with {last_count} matches. Consider raising MAX_SCROLL_STEPS "
+                  f"if this happens consistently.")
 
+        # Final snapshot + raw HTML, saved regardless of outcome, so every run leaves
+        # a trail you can inspect after the fact via the workflow's uploaded artifact.
+        await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=True)
         content = await page.content()
+        with open(f"{DEBUG_DIR}/{run_label}_final.html", "w", encoding="utf-8") as f:
+            f.write(content)
+        with open(f"{DEBUG_DIR}/{run_label}_step_counts.txt", "w") as f:
+            f.write("step,matches_detected\n")
+            for i, c in enumerate(step_counts):
+                f.write(f"{i},{c}\n")
+
         await browser.close()
         return content
 
@@ -165,7 +219,7 @@ def get_coefficient(row):
 
 def scrape_forebet(target_day):
     url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
-    html_content = asyncio.run(fetch_full_html(url))
+    html_content = asyncio.run(fetch_full_html(url, run_label=target_day))
     soup = BeautifulSoup(html_content, "html.parser")
 
     home_elements = soup.select(".homeTeam, [class*='homeTeam']")
@@ -174,6 +228,7 @@ def scrape_forebet(target_day):
     results = []
     seen_matches = set()
     validated_count = 0
+    skipped_no_container = 0
 
     for home_el in home_elements:
         # Ascend DOM until finding nearest parent containing awayTeam, probabilities, and only 1 match
@@ -194,6 +249,7 @@ def scrape_forebet(target_day):
             curr = curr.parent
 
         if not row_container or probabilities is None:
+            skipped_no_container += 1
             continue
 
         home_element = row_container.select_one(".homeTeam, [class*='homeTeam']")
@@ -237,6 +293,7 @@ def scrape_forebet(target_day):
     stats = {
         "raw_detected": raw_detected_count,
         "validated_parsed": validated_count,
+        "skipped_no_container": skipped_no_container,
         "selected_picks": len(results),
     }
 
@@ -288,8 +345,10 @@ if __name__ == "__main__":
     lines.append("📊 Validation Diagnostics:")
     lines.append(f"• Match nodes detected in DOM: {stats['raw_detected']}")
     lines.append(f"• Validated match rows parsed: {stats['validated_parsed']}")
+    lines.append(f"• Rows skipped (no valid container found): {stats['skipped_no_container']}")
     lines.append(f"• Picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
 
     message = "\n".join(lines)
     send_telegram_message(message)
     print("Telegram notification dispatched successfully.")
+    print(f"Debug artifacts (screenshots, final HTML, step-by-step counts) saved to ./{DEBUG_DIR}/")
