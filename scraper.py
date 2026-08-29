@@ -51,18 +51,26 @@ async def click_all_more_buttons(page):
     the first one. Sites that group matches by league often render one such
     control per section, so query_selector (singular) silently misses all but
     the first section's button.
+
+    IMPORTANT: Forebet's real pagination control is a bare <span> with an
+    inline onclick handler calling their ltodrows(...) JS function - it has
+    NO id or class, so generic id/class selectors never match it. We target
+    that onclick pattern directly. The previous broad [class*='show-more'] /
+    [class*='loadMore'] patterns were accidentally matching Google AdSense's
+    "Discover more" content-recommendation widget instead (visible as stray
+    popups in debug screenshots) - those have been removed.
     """
     clicked = 0
     buttons = await page.query_selector_all(
         "#btn_more, .schema-more, a[id*='more'], button[id*='more'], "
-        "[class*='show-more'], [class*='loadMore'], [class*='load-more']"
+        "span[onclick*='ltodrows']"
     )
     for btn in buttons:
         try:
             if await btn.is_visible():
                 await btn.click(timeout=2000)
                 clicked += 1
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(600)  # ltodrows() fetches via AJAX, give it time
         except Exception:
             # Button may have detached from DOM after a previous click re-rendered
             # the list; that's fine, just move on to the next one.
