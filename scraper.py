@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import html
 import asyncio
 import requests
 from bs4 import BeautifulSoup
@@ -216,6 +217,45 @@ def extract_probabilities_from_container(container):
     return None
 
 
+def extract_match_meta(container):
+    """
+    Pulls the three pieces needed for the message header line:
+      - flag_code: 2-letter country code from the flag image filename
+                   (e.g. .../images/fc/br.png -> "br"), converted to an
+                   actual flag emoji below since Telegram can't embed an
+                   inline logo image in a plain text message.
+      - league_tag: the short competition code shown beneath the flag
+                   on the site (e.g. "Br2").
+      - match_datetime: the raw date/time string Forebet displays
+                   (e.g. "08/28/2026 11:30 PM").
+    Any piece that isn't found falls back to an empty string so a single
+    missing field never breaks the whole row.
+    """
+    flag_code = ""
+    img_el = container.select_one("img.flsc")
+    if img_el and img_el.get("src"):
+        match = re.search(r"/fc/([a-zA-Z0-9_-]+)\.png", img_el["src"])
+        if match:
+            flag_code = match.group(1)
+
+    tag_el = container.select_one(".shortTag")
+    league_tag = tag_el.get_text(strip=True) if tag_el else ""
+
+    date_el = container.select_one(".date_bah")
+    match_datetime = date_el.get_text(strip=True) if date_el else ""
+
+    return flag_code, league_tag, match_datetime
+
+
+def flag_emoji(code):
+    """Converts a 2-letter country code into its Unicode flag emoji.
+    Falls back to '' for codes that aren't a plain 2-letter alphabetic
+    code (some competitions use confederation logos, not country flags)."""
+    if not code or len(code) != 2 or not code.isalpha():
+        return ""
+    return "".join(chr(0x1F1E6 + (ord(c.upper()) - ord("A"))) for c in code)
+
+
 def get_coefficient(row):
     """
     Forebet's "Coef." column renders as <span class="lscrsp">. There is a
@@ -319,6 +359,8 @@ def scrape_forebet(target_day):
             pick = "2 — Away win"
             prob = away_prob
 
+        flag_code, league_tag, match_datetime = extract_match_meta(row_container)
+
         results.append(
             {
                 "home": home_team,
@@ -326,6 +368,9 @@ def scrape_forebet(target_day):
                 "pick": pick,
                 "probability": prob,
                 "coefficient": get_coefficient(row_container),
+                "flag": flag_emoji(flag_code),
+                "league_tag": league_tag,
+                "datetime": match_datetime,
             }
         )
 
@@ -346,16 +391,49 @@ def scrape_forebet(target_day):
     return sorted_results, stats
 
 
+def probability_emoji(prob):
+    """Color-coded circle for the probability tier. Telegram messages can't
+    render custom text colors (that's a platform limit, not a code choice),
+    so colored emoji stand in as the visual cue instead."""
+    if prob >= 90:
+        return "🟢"
+    if prob >= 80:
+        return "🟡"
+    return "🟠"
+
+
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables.")
 
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    for start in range(0, len(message), 4000):
+    # Split on blank-line boundaries (between picks) rather than a blind
+    # character-count slice, so we never cut an HTML tag in half mid-chunk
+    # and break formatting for the rest of that message part.
+    blocks = message.split("\n\n")
+    chunks = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > 3900:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
         response = requests.post(
             telegram_url,
-            json={"chat_id": CHAT_ID, "text": message[start : start + 4000]},
+            json={
+                "chat_id": CHAT_ID,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
             timeout=30,
         )
         response.raise_for_status()
@@ -369,20 +447,29 @@ if __name__ == "__main__":
     picks, stats = scrape_forebet(target_day)
 
     lines = [
-        f"⚽ Forebet picks for {target_day.upper()}",
-        f"Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%\n",
+        f"⚽ <b>Forebet picks for {target_day.upper()}</b>",
+        f"<i>Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%</i>\n",
     ]
 
     if picks:
         for item in picks:
             coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
-            lines.append(f"• {item['home']} vs {item['away']}")
-            lines.append(f"  Pick: {item['pick']} ({item['probability']}%) | COEF: {coef_str}\n")
+            dot = probability_emoji(item["probability"])
+            home = html.escape(item["home"])
+            away = html.escape(item["away"])
+            pick_text = html.escape(item["pick"])
+            header_bits = [b for b in [item["flag"], html.escape(item["league_tag"]), html.escape(item["datetime"])] if b]
+            if header_bits:
+                lines.append(f"{dot} {' '.join(header_bits)}")
+                lines.append(f"<b>{home} vs {away}</b>")
+            else:
+                lines.append(f"{dot} <b>{home} vs {away}</b>")
+            lines.append(f"Pick: <b>{pick_text}</b> ({item['probability']}%) | COEF: <code>{coef_str}</code>\n")
     else:
         lines.append("No matches found matching criteria.\n")
 
     lines.append("---")
-    lines.append("📊 Validation Diagnostics:")
+    lines.append("📊 <b>Validation Diagnostics:</b>")
     lines.append(f"• Match nodes detected in DOM: {stats['raw_detected']}")
     lines.append(f"• Validated match rows parsed: {stats['validated_parsed']}")
     lines.append(f"• Rows skipped (no valid container found): {stats['skipped_no_container']}")
