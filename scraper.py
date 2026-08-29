@@ -238,7 +238,8 @@ def extract_probabilities_from_container(container):
 
 def extract_match_meta(container):
     """
-    Pulls the three pieces needed for the message header line:
+    Pulls the pieces needed for the message header line, plus the match
+    detail page URL (needed separately for head-to-head lookups):
       - flag_code: 2-letter country code from the flag image filename
                    (e.g. .../images/fc/br.png -> "br"), converted to an
                    actual flag emoji below since Telegram can't embed an
@@ -247,6 +248,10 @@ def extract_match_meta(container):
                    on the site (e.g. "Br2").
       - match_datetime: the raw date/time string Forebet displays
                    (e.g. "08/28/2026 11:30 PM").
+      - match_url: absolute URL to this match's detail page
+                   (e.g. https://www.forebet.com/en/football/matches/...),
+                   used later to fetch head-to-head history for picks that
+                   clear the probability filter.
     Any piece that isn't found falls back to an empty string so a single
     missing field never breaks the whole row.
     """
@@ -263,7 +268,13 @@ def extract_match_meta(container):
     date_el = container.select_one(".date_bah")
     match_datetime = date_el.get_text(strip=True) if date_el else ""
 
-    return flag_code, league_tag, match_datetime
+    match_url = ""
+    link_el = container.select_one("a.tnmscn")
+    if link_el and link_el.get("href"):
+        href = link_el["href"]
+        match_url = href if href.startswith("http") else f"https://www.forebet.com{href}"
+
+    return flag_code, league_tag, match_datetime, match_url
 
 
 def flag_emoji(code):
@@ -313,6 +324,136 @@ def get_coefficient(row):
         return float(text)
 
     return 0.0
+
+
+def parse_h2h_letters(page_html, candidate_team_name, max_entries=5):
+    """
+    Parses a match detail page's "Head to head" module and returns a string
+    of W/L/T letters (most recent first) from the perspective of
+    candidate_team_name - the team our scraper actually picked (whichever
+    of home/away had the higher probability).
+
+    Markup (confirmed from a real saved match page):
+      <div class="moduletable">
+        <div class="mptlt">Head to head</div>
+        <div class="st_scrblock"><div class="st_rmain">
+          <div class="st_row ...">
+            <div class="st_hteam"><a>Team A</a></div>
+            <div class="st_rescnt"><span class="st_res">X - Y</span>...</div>
+            <div class="st_ateam"><a>Team B</a></div>
+          </div>
+          ... (older entries live nested one level deeper inside a
+               .hidd_stat wrapper - selecting only DIRECT .st_row children
+               of .st_rmain naturally skips those without needing to click
+               "show more")
+        </div></div>
+      </div>
+
+    Every row in this module is between the same two teams by definition
+    (that's what makes it head-to-head), so rather than trust the site's
+    own "active-team" CSS class (which was inconsistent across rows when
+    inspected), this matches team names directly against the score.
+    """
+    soup = BeautifulSoup(page_html, "html.parser")
+
+    h2h_module = None
+    for module in soup.select(".moduletable"):
+        title_el = module.select_one(".mptlt")
+        if title_el and "head to head" in title_el.get_text(strip=True).lower():
+            h2h_module = module
+            break
+
+    if not h2h_module:
+        return ""
+
+    rows = h2h_module.select(".st_rmain > .st_row")
+    candidate_norm = candidate_team_name.strip().lower()
+    letters = []
+
+    for row in rows[:max_entries]:
+        hteam_el = row.select_one(".st_hteam a")
+        ateam_el = row.select_one(".st_ateam a")
+        score_el = row.select_one(".st_rescnt .st_res")
+        if not hteam_el or not ateam_el or not score_el:
+            continue
+
+        hteam = hteam_el.get_text(strip=True)
+        ateam = ateam_el.get_text(strip=True)
+        score_match = re.match(r"(\d+)\s*-\s*(\d+)", score_el.get_text(strip=True))
+        if not score_match:
+            continue
+        home_goals, away_goals = int(score_match.group(1)), int(score_match.group(2))
+
+        if hteam.strip().lower() == candidate_norm:
+            letters.append("W" if home_goals > away_goals else "L" if home_goals < away_goals else "T")
+        elif ateam.strip().lower() == candidate_norm:
+            letters.append("W" if away_goals > home_goals else "L" if away_goals < home_goals else "T")
+        # else: name didn't match either side (rare formatting mismatch) - skip that row silently
+
+    return " ".join(letters)
+
+
+async def fetch_h2h_for_picks(picks):
+    """
+    Visits each pick's individual match page to pull head-to-head history -
+    ONLY for picks that already cleared the probability filter (typically a
+    handful to a few dozen per run), never for the full raw match list
+    (which can run past 1000 on a busy day). Reuses a single FlareSolverr
+    clearance + browser context across all of them rather than paying the
+    Cloudflare-clearance cost once per match.
+    Returns {match_url: "W L T ..."} - a failure on any single match page
+    just leaves that entry empty rather than aborting the whole batch.
+    """
+    if not picks:
+        return {}
+
+    sample_url = picks[0]["match_url"]
+    cookies, user_agent = get_flaresolverr_clearance(sample_url)
+    h2h_map = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        pw_cookies = [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c["domain"],
+                "path": c.get("path", "/"),
+            }
+            for c in cookies
+        ]
+        context = await browser.new_context(user_agent=user_agent, viewport={"width": 1440, "height": 900})
+        await context.add_cookies(pw_cookies)
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        page = await context.new_page()
+
+        for item in picks:
+            url = item.get("match_url")
+            if not url:
+                continue
+            try:
+                print(f"Fetching H2H for: {item['home']} vs {item['away']}")
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(800)  # let the H2H module hydrate
+                content = await page.content()
+                h2h_map[url] = parse_h2h_letters(content, item["candidate_team"])
+            except Exception as e:
+                print(f"Warning: H2H fetch failed for {url}, leaving blank: {e}")
+                h2h_map[url] = ""
+
+        await browser.close()
+
+    return h2h_map
 
 
 def scrape_forebet(target_day):
@@ -374,11 +515,13 @@ def scrape_forebet(target_day):
         if home_prob >= away_prob:
             pick = "1 — Home win"
             prob = home_prob
+            candidate_team = home_team
         else:
             pick = "2 — Away win"
             prob = away_prob
+            candidate_team = away_team
 
-        flag_code, league_tag, match_datetime = extract_match_meta(row_container)
+        flag_code, league_tag, match_datetime, match_url = extract_match_meta(row_container)
 
         results.append(
             {
@@ -390,6 +533,9 @@ def scrape_forebet(target_day):
                 "flag": flag_emoji(flag_code),
                 "league_tag": league_tag,
                 "datetime": match_datetime,
+                "match_url": match_url,
+                "candidate_team": candidate_team,
+                "h2h": "",
             }
         )
 
@@ -399,6 +545,14 @@ def scrape_forebet(target_day):
         "skipped_no_container": skipped_no_container,
         "selected_picks": len(results),
     }
+
+    # H2H is only fetched for picks that already cleared the probability
+    # filter above - keeps this to a handful of extra page visits per run
+    # instead of one per raw match (which could be 1000+ on a busy day).
+    if results:
+        h2h_map = asyncio.run(fetch_h2h_for_picks(results))
+        for item in results:
+            item["h2h"] = h2h_map.get(item["match_url"], "")
 
     # Sorted by coefficient first (highest payout first), probability as tiebreaker.
     sorted_results = sorted(
@@ -466,7 +620,7 @@ if __name__ == "__main__":
     picks, stats = scrape_forebet(target_day)
 
     lines = [
-        f"⚽ <b> picks for {target_day.upper()}</b>",
+        f"⚽ <b>Forebet picks for {target_day.upper()}</b>",
         f"<i>Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%</i>\n",
     ]
 
@@ -483,7 +637,12 @@ if __name__ == "__main__":
                 lines.append(f"<b>{home} vs {away}</b>")
             else:
                 lines.append(f"{dot} <b>{home} vs {away}</b>")
-            lines.append(f"Pick: <b>{pick_text}</b> ({item['probability']}%) | COEF: <code>{coef_str}</code>\n")
+            lines.append(f"Pick: <b>{pick_text}</b> ({item['probability']}%) | COEF: <code>{coef_str}</code>")
+            if item.get("h2h"):
+                candidate = html.escape(item["candidate_team"])
+                lines.append(f"H2H ({candidate}): <code>{item['h2h']}</code>\n")
+            else:
+                lines.append("")
     else:
         lines.append("No matches found matching criteria.\n")
 
