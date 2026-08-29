@@ -18,11 +18,11 @@ TARGET_URLS = {
 
 MINIMUM_PROBABILITY = 75
 
-# --- Tunables pulled out so they're easy to bump without hunting through the code ---
-HYDRATION_TIMEOUT_MS = 40000       # was 20000 - give slow AJAX more room
-MAX_SCROLL_STEPS = 45              # was 30 - more room to reach the bottom
-SCROLL_PAUSE_MS = 700              # was 600 - slightly gentler pacing
-STAGNATION_STEPS_REQUIRED = 10     # was 5 - don't bail on a brief lull
+# --- Tunables ---
+HYDRATION_TIMEOUT_MS = 40000
+MAX_SCROLL_STEPS = 45
+SCROLL_PAUSE_MS = 700
+STAGNATION_STEPS_REQUIRED = 10
 DEBUG_DIR = "debug_artifacts"
 
 
@@ -47,20 +47,6 @@ def get_flaresolverr_clearance(url):
 
 
 async def click_all_more_buttons(page):
-    """
-    Click EVERY visible 'load more' / pagination control on the page, not just
-    the first one. Sites that group matches by league often render one such
-    control per section, so query_selector (singular) silently misses all but
-    the first section's button.
-
-    IMPORTANT: Forebet's real pagination control is a bare <span> with an
-    inline onclick handler calling their ltodrows(...) JS function - it has
-    NO id or class, so generic id/class selectors never match it. We target
-    that onclick pattern directly. The previous broad [class*='show-more'] /
-    [class*='loadMore'] patterns were accidentally matching Google AdSense's
-    "Discover more" content-recommendation widget instead (visible as stray
-    popups in debug screenshots) - those have been removed.
-    """
     clicked = 0
     buttons = await page.query_selector_all(
         "#btn_more, .schema-more, a[id*='more'], button[id*='more'], "
@@ -71,10 +57,8 @@ async def click_all_more_buttons(page):
             if await btn.is_visible():
                 await btn.click(timeout=2000)
                 clicked += 1
-                await page.wait_for_timeout(600)  # ltodrows() fetches via AJAX, give it time
+                await page.wait_for_timeout(600)
         except Exception:
-            # Button may have detached from DOM after a previous click re-rendered
-            # the list; that's fine, just move on to the next one.
             continue
     return clicked
 
@@ -112,7 +96,6 @@ async def fetch_full_html(url, run_label="run"):
         )
         await context.add_cookies(pw_cookies)
 
-        # Mask automation footprint to allow sub-resource AJAX calls through Cloudflare
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
@@ -122,17 +105,11 @@ async def fetch_full_html(url, run_label="run"):
         print(f"Navigating to match table: {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=90000)
 
-        # Save what the page looked like immediately after the initial clearance-backed
-        # load, before any of our own scrolling/clicking. If Cloudflare is soft-blocking
-        # the hydration AJAX calls, this snapshot will already look "stuck".
-        # Wrapped in try/except: a debug screenshot failing (e.g. timing out on an
-        # unusually tall page) must never crash the actual scrape/send run.
         try:
             await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_00_initial.png", full_page=True, timeout=60000)
         except Exception as e:
             print(f"Warning: initial debug screenshot failed/timed out, continuing anyway: {e}")
 
-        # Wait for dynamic matches to hydrate into the DOM
         try:
             await page.wait_for_function(
                 "document.querySelectorAll('.homeTeam, [class*=\"homeTeam\"]').length > 10",
@@ -142,7 +119,6 @@ async def fetch_full_html(url, run_label="run"):
         except Exception:
             print("Warning: Initial hydration timeout reached. Continuing with incremental scroll...")
 
-        # Incremental step scroll to trigger IntersectionObserver and scroll listeners
         print("Executing incremental step scrolling...")
         last_count = 0
         stagnant_steps = 0
@@ -156,8 +132,6 @@ async def fetch_full_html(url, run_label="run"):
             current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
             step_counts.append(current_count)
 
-            # Per-step diagnostic logging so a stalled run is easy to diagnose
-            # from the Action logs alone, without needing to reproduce locally.
             print(
                 f"  step {step:02d}: matches_detected={current_count} "
                 f"more_buttons_clicked={clicked} stagnant_steps={stagnant_steps}"
@@ -174,25 +148,16 @@ async def fetch_full_html(url, run_label="run"):
                 last_count = current_count
         else:
             print(f"Reached MAX_SCROLL_STEPS ({MAX_SCROLL_STEPS}) without full stagnation; "
-                  f"stopping with {last_count} matches. Consider raising MAX_SCROLL_STEPS "
-                  f"if this happens consistently.")
+                  f"stopping with {last_count} matches.")
 
-        # Final snapshot + raw HTML, saved regardless of outcome, so every run leaves
-        # a trail you can inspect after the fact via the workflow's uploaded artifact.
-        # This is where the crash happened: a full-page screenshot on a page that has
-        # grown very tall (e.g. 1000+ matches after a real "load more" click) can take
-        # far longer than Playwright's default 30s timeout. Same try/except pattern as
-        # above - if it still fails even with the longer timeout, fall back to a
-        # viewport-only (non-full-page) screenshot instead of giving up entirely, and
-        # if even that fails, skip the screenshot rather than crash the whole run.
         try:
             await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=True, timeout=90000)
         except Exception as e:
-            print(f"Warning: full-page final screenshot failed/timed out ({e}), trying viewport-only fallback...")
+            print(f"Warning: full-page final screenshot failed ({e}), trying viewport fallback...")
             try:
                 await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=False, timeout=30000)
             except Exception as e2:
-                print(f"Warning: viewport screenshot also failed, skipping final screenshot entirely: {e2}")
+                print(f"Warning: viewport screenshot failed, skipping final screenshot: {e2}")
 
         content = await page.content()
         with open(f"{DEBUG_DIR}/{run_label}_final.html", "w", encoding="utf-8") as f:
@@ -207,7 +172,6 @@ async def fetch_full_html(url, run_label="run"):
 
 
 def extract_probabilities_from_container(container):
-    # 1. Target dedicated outcome percentage elements (.fprt or forebet_p1/p2/p3)
     fprt_elements = container.select(".fprt, .forebet_p1, .forebet_p2, .forebet_p3, [class*='prob']")
     if fprt_elements:
         combined_text = " ".join([el.get_text(" ", strip=True) for el in fprt_elements])
@@ -217,7 +181,6 @@ def extract_probabilities_from_container(container):
             if 90 <= (h + d + a) <= 110:
                 return h, d, a
 
-    # 2. Fallback: Strip non-probability elements and parse clean numerical content
     clean_copy = BeautifulSoup(str(container), "html.parser")
     for tag_name in [
         ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
@@ -237,24 +200,6 @@ def extract_probabilities_from_container(container):
 
 
 def extract_match_meta(container):
-    """
-    Pulls the pieces needed for the message header line, plus the match
-    detail page URL (needed separately for head-to-head lookups):
-      - flag_code: 2-letter country code from the flag image filename
-                   (e.g. .../images/fc/br.png -> "br"), converted to an
-                   actual flag emoji below since Telegram can't embed an
-                   inline logo image in a plain text message.
-      - league_tag: the short competition code shown beneath the flag
-                   on the site (e.g. "Br2").
-      - match_datetime: the raw date/time string Forebet displays
-                   (e.g. "08/28/2026 11:30 PM").
-      - match_url: absolute URL to this match's detail page
-                   (e.g. https://www.forebet.com/en/football/matches/...),
-                   used later to fetch head-to-head history for picks that
-                   clear the probability filter.
-    Any piece that isn't found falls back to an empty string so a single
-    missing field never breaks the whole row.
-    """
     flag_code = ""
     img_el = container.select_one("img.flsc")
     if img_el and img_el.get("src"):
@@ -278,28 +223,12 @@ def extract_match_meta(container):
 
 
 def flag_emoji(code):
-    """Converts a 2-letter country code into its Unicode flag emoji.
-    Falls back to '' for codes that aren't a plain 2-letter alphabetic
-    code (some competitions use confederation logos, not country flags)."""
     if not code or len(code) != 2 or not code.isalpha():
         return ""
     return "".join(chr(0x1F1E6 + (ord(c.upper()) - ord("A"))) for c in code)
 
 
 def get_coefficient(row):
-    """
-    Forebet's "Coef." column renders as <span class="lscrsp">. There is a
-    visually adjacent but DIFFERENT column, "Live coef.", which uses
-    <span class="lscrsp lcurodd"> - same base class, extra modifier class.
-    Selecting plain ".lscrsp" without excluding ".lcurodd" would grab
-    whichever one BeautifulSoup finds first, silently mixing the two columns.
-    ":not(.lcurodd)" excludes the live-odds variant explicitly.
-
-    Also note: Forebet renders this column in EITHER American odds format
-    (+155, -154) or decimal odds format (1.33) depending on locale/session -
-    confirmed by comparing two different scrape runs. Both are normalized to
-    decimal odds here so sorting/output stays consistent either way.
-    """
     odds_element = row.select_one(".lscrsp:not(.lcurodd)")
     if not odds_element:
         return 0.0
@@ -309,7 +238,6 @@ def get_coefficient(row):
     if not text or text in ("-", "no"):
         return 0.0
 
-    # American odds format: +155 / -154
     american_match = re.fullmatch(r"[+-]\d+", text)
     if american_match:
         value = int(text)
@@ -318,7 +246,6 @@ def get_coefficient(row):
         else:
             return round((100 / abs(value)) + 1, 2)
 
-    # Decimal odds format: 1.33
     decimal_match = re.fullmatch(r"\d+(?:\.\d+)?", text)
     if decimal_match:
         return float(text)
@@ -327,33 +254,6 @@ def get_coefficient(row):
 
 
 def parse_h2h_letters(page_html, candidate_team_name, max_entries=5):
-    """
-    Parses a match detail page's "Head to head" module and returns a string
-    of W/L/T letters (most recent first) from the perspective of
-    candidate_team_name - the team our scraper actually picked (whichever
-    of home/away had the higher probability).
-
-    Markup (confirmed from a real saved match page):
-      <div class="moduletable">
-        <div class="mptlt">Head to head</div>
-        <div class="st_scrblock"><div class="st_rmain">
-          <div class="st_row ...">
-            <div class="st_hteam"><a>Team A</a></div>
-            <div class="st_rescnt"><span class="st_res">X - Y</span>...</div>
-            <div class="st_ateam"><a>Team B</a></div>
-          </div>
-          ... (older entries live nested one level deeper inside a
-               .hidd_stat wrapper - selecting only DIRECT .st_row children
-               of .st_rmain naturally skips those without needing to click
-               "show more")
-        </div></div>
-      </div>
-
-    Every row in this module is between the same two teams by definition
-    (that's what makes it head-to-head), so rather than trust the site's
-    own "active-team" CSS class (which was inconsistent across rows when
-    inspected), this matches team names directly against the score.
-    """
     soup = BeautifulSoup(page_html, "html.parser")
 
     h2h_module = None
@@ -388,22 +288,11 @@ def parse_h2h_letters(page_html, candidate_team_name, max_entries=5):
             letters.append("W" if home_goals > away_goals else "L" if home_goals < away_goals else "T")
         elif ateam.strip().lower() == candidate_norm:
             letters.append("W" if away_goals > home_goals else "L" if away_goals < home_goals else "T")
-        # else: name didn't match either side (rare formatting mismatch) - skip that row silently
 
     return " ".join(letters)
 
 
 async def fetch_h2h_for_picks(picks):
-    """
-    Visits each pick's individual match page to pull head-to-head history -
-    ONLY for picks that already cleared the probability filter (typically a
-    handful to a few dozen per run), never for the full raw match list
-    (which can run past 1000 on a busy day). Reuses a single FlareSolverr
-    clearance + browser context across all of them rather than paying the
-    Cloudflare-clearance cost once per match.
-    Returns {match_url: "W L T ..."} - a failure on any single match page
-    just leaves that entry empty rather than aborting the whole batch.
-    """
     if not picks:
         return {}
 
@@ -444,7 +333,7 @@ async def fetch_h2h_for_picks(picks):
             try:
                 print(f"Fetching H2H for: {item['home']} vs {item['away']}")
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(800)  # let the H2H module hydrate
+                await page.wait_for_timeout(800)
                 content = await page.content()
                 h2h_map[url] = parse_h2h_letters(content, item["candidate_team"])
             except Exception as e:
@@ -454,6 +343,19 @@ async def fetch_h2h_for_picks(picks):
         await browser.close()
 
     return h2h_map
+
+
+def format_h2h_boxes(h2h_str):
+    """Converts W/T/L sequence into colored emoji box badges for Telegram."""
+    if not h2h_str:
+        return ""
+    box_map = {
+        "W": "🟩 W",
+        "T": "🟨 T",
+        "L": "🟥 L",
+    }
+    letters = h2h_str.split()
+    return "  ".join([box_map.get(l, l) for l in letters])
 
 
 def scrape_forebet(target_day):
@@ -470,7 +372,6 @@ def scrape_forebet(target_day):
     skipped_no_container = 0
 
     for home_el in home_elements:
-        # Ascend DOM until finding nearest parent containing awayTeam, probabilities, and only 1 match
         curr = home_el.parent
         row_container = None
         probabilities = None
@@ -546,15 +447,11 @@ def scrape_forebet(target_day):
         "selected_picks": len(results),
     }
 
-    # H2H is only fetched for picks that already cleared the probability
-    # filter above - keeps this to a handful of extra page visits per run
-    # instead of one per raw match (which could be 1000+ on a busy day).
     if results:
         h2h_map = asyncio.run(fetch_h2h_for_picks(results))
         for item in results:
             item["h2h"] = h2h_map.get(item["match_url"], "")
 
-    # Sorted by coefficient first (highest payout first), probability as tiebreaker.
     sorted_results = sorted(
         results,
         key=lambda item: (item["coefficient"], item["probability"]),
@@ -565,9 +462,6 @@ def scrape_forebet(target_day):
 
 
 def probability_emoji(prob):
-    """Color-coded circle for the probability tier. Telegram messages can't
-    render custom text colors (that's a platform limit, not a code choice),
-    so colored emoji stand in as the visual cue instead."""
     if prob >= 90:
         return "🟢"
     if prob >= 80:
@@ -581,9 +475,6 @@ def send_telegram_message(message):
 
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    # Split on blank-line boundaries (between picks) rather than a blind
-    # character-count slice, so we never cut an HTML tag in half mid-chunk
-    # and break formatting for the rest of that message part.
     blocks = message.split("\n\n")
     chunks = []
     current = ""
@@ -640,7 +531,8 @@ if __name__ == "__main__":
             lines.append(f"Pick: <b>{pick_text}</b> ({item['probability']}%) | COEF: <code>{coef_str}</code>")
             if item.get("h2h"):
                 candidate = html.escape(item["candidate_team"])
-                lines.append(f"H2H ({candidate}): <code>{item['h2h']}</code>\n")
+                h2h_formatted = format_h2h_boxes(item["h2h"])
+                lines.append(f"H2H ({candidate}): {h2h_formatted}\n")
             else:
                 lines.append("")
     else:
