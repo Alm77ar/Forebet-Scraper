@@ -346,14 +346,18 @@ async def fetch_h2h_for_picks(picks):
 
 
 def format_h2h_boxes(h2h_str):
-    """Converts W/T/L sequence into colored emoji box badges for Telegram."""
+    """
+    Compact colored letter badges formatted with wider spacing for a dedicated line.
+    """
     if not h2h_str:
         return ""
+    
     box_map = {
-        "W": "🟩 W",
-        "T": "🟨 T",
-        "L": "🟥 L",
+        "W": "🟩W",
+        "T": "🟨T",
+        "L": "🟥L",
     }
+
     letters = h2h_str.split()
     return "  ".join([box_map.get(l, l) for l in letters])
 
@@ -512,7 +516,7 @@ if __name__ == "__main__":
 
     lines = [
         f"⚽ <b>Forebet picks for {target_day.upper()}</b>",
-        f"<i>Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%</i>\n",
+        f"<i>Filter: Win probability ≥ {MINIMUM_PROBABILITY}%</i>\n",
     ]
 
     if picks:
@@ -522,17 +526,25 @@ if __name__ == "__main__":
             home = html.escape(item["home"])
             away = html.escape(item["away"])
             pick_text = html.escape(item["pick"])
-            header_bits = [b for b in [item["flag"], html.escape(item["league_tag"]), html.escape(item["datetime"])] if b]
-            if header_bits:
-                lines.append(f"{dot} {' '.join(header_bits)}")
-                lines.append(f"<b>{home} vs {away}</b>")
+            
+            # Metadata header formatting
+            meta_parts = [b for b in [item["flag"], html.escape(item["league_tag"]), html.escape(item["datetime"])] if b]
+            meta_str = " • ".join(meta_parts)
+            
+            if meta_str:
+                lines.append(f"{dot} {meta_str}")
             else:
-                lines.append(f"{dot} <b>{home} vs {away}</b>")
-            lines.append(f"Pick: <b>{pick_text}</b> ({item['probability']}%) | COEF: <code>{coef_str}</code>")
+                lines.append(f"{dot}")
+                
+            lines.append(f"<b>{home} vs {away}</b>")
+            lines.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
+            
             if item.get("h2h"):
                 candidate = html.escape(item["candidate_team"])
                 h2h_formatted = format_h2h_boxes(item["h2h"])
-                lines.append(f"H2H ({candidate}): {h2h_formatted}\n")
+                # Label on top, formatted badges isolated on their own line below
+                lines.append(f"📊 H2H ({candidate}):")
+                lines.append(f"{h2h_formatted}\n")
             else:
                 lines.append("")
     else:
