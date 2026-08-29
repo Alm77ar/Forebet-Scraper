@@ -5,8 +5,8 @@ schedule:
 # 7:00 AM Saudi Arabia time (UTC+3, no daylight saving) = 1:00 AM UTC.
 # This single trigger sends BOTH today's and tomorrow's picks - see the
 # scheduled step below, which runs the scraper twice in one job.
-    - cron: "0 9 * * *"
-    - cron: "20 10 * * *"
+    - cron: "42 10 * * *"
+    #- cron: "20 10 * * *"
 
 workflow_dispatch:
 inputs:
