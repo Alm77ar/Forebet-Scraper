@@ -2,6 +2,9 @@ name: Forebet Daily Scraper
 
 on:
   schedule:
+    # 7:00 AM Saudi Arabia time (UTC+3, no daylight saving) = 1:00 AM UTC.
+    # This single trigger sends BOTH today's and tomorrow's picks - see the
+    # scheduled step below, which runs the scraper twice in one job.
     - cron: "0 4 * * *"
 
   workflow_dispatch:
@@ -18,7 +21,7 @@ on:
 jobs:
   scrape-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     services:
       flaresolverr:
@@ -48,7 +51,23 @@ jobs:
           pip install playwright beautifulsoup4 requests
           playwright install chromium
 
-      - name: Scrape Forebet and send Telegram message
+      # Runs only on the 4 AM Saudi-time schedule: sends TWO Telegram messages,
+      # today's picks first, then tomorrow's, in the same job run.
+      - name: Scrape and send (scheduled - today + tomorrow)
+        if: github.event_name == 'schedule'
+        timeout-minutes: 25
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FLARESOLVERR_URL: "http://localhost:8191/v1"
+        run: |
+          python -u scraper.py today
+          python -u scraper.py tomorrow
+
+      # Runs only when manually triggered from the Actions tab: sends just the
+      # single day chosen in the dropdown (defaults to "today" if omitted).
+      - name: Scrape and send (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
         timeout-minutes: 15
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
