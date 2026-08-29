@@ -217,12 +217,43 @@ def extract_probabilities_from_container(container):
 
 
 def get_coefficient(row):
-    odds_element = row.select_one(".forebet_odds, [class*='odds']")
+    """
+    Forebet's "Coef." column renders as <span class="lscrsp">. There is a
+    visually adjacent but DIFFERENT column, "Live coef.", which uses
+    <span class="lscrsp lcurodd"> - same base class, extra modifier class.
+    Selecting plain ".lscrsp" without excluding ".lcurodd" would grab
+    whichever one BeautifulSoup finds first, silently mixing the two columns.
+    ":not(.lcurodd)" excludes the live-odds variant explicitly.
+
+    Also note: Forebet renders this column in EITHER American odds format
+    (+155, -154) or decimal odds format (1.33) depending on locale/session -
+    confirmed by comparing two different scrape runs. Both are normalized to
+    decimal odds here so sorting/output stays consistent either way.
+    """
+    odds_element = row.select_one(".lscrsp:not(.lcurodd)")
     if not odds_element:
         return 0.0
 
-    match = re.search(r"\d+(?:\.\d+)?", odds_element.get_text(" ", strip=True))
-    return float(match.group()) if match else 0.0
+    text = odds_element.get_text(strip=True)
+
+    if not text or text in ("-", "no"):
+        return 0.0
+
+    # American odds format: +155 / -154
+    american_match = re.fullmatch(r"[+-]\d+", text)
+    if american_match:
+        value = int(text)
+        if value > 0:
+            return round((value / 100) + 1, 2)
+        else:
+            return round((100 / abs(value)) + 1, 2)
+
+    # Decimal odds format: 1.33
+    decimal_match = re.fullmatch(r"\d+(?:\.\d+)?", text)
+    if decimal_match:
+        return float(text)
+
+    return 0.0
 
 
 def scrape_forebet(target_day):
@@ -305,9 +336,10 @@ def scrape_forebet(target_day):
         "selected_picks": len(results),
     }
 
+    # Sorted by coefficient first (highest payout first), probability as tiebreaker.
     sorted_results = sorted(
         results,
-        key=lambda item: (item["probability"], item["coefficient"]),
+        key=lambda item: (item["coefficient"], item["probability"]),
         reverse=True,
     )
 
@@ -337,7 +369,7 @@ if __name__ == "__main__":
     picks, stats = scrape_forebet(target_day)
 
     lines = [
-        f"⚽  picks for {target_day.upper()}",
+        f"⚽ Forebet picks for {target_day.upper()}",
         f"Filter: Home or Away win probability ≥ {MINIMUM_PROBABILITY}%\n",
     ]
 
