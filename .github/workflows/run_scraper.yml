@@ -3,7 +3,7 @@ name: Forebet Daily Scraper
 on:
   schedule:
     # 7:00 AM Saudi Arabia time (UTC+3) = 1:00 AM UTC
-    - cron: "01 02 * * *"
+    - cron: "01 00 * * *"
   workflow_dispatch:
     inputs:
       target_day:
