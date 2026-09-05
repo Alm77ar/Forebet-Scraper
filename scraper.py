@@ -299,7 +299,14 @@ def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_result
         print(f"  H2H debug [{debug_label}]: no 'Head to head' module found on page at all.")
         return ""
 
-    rows = h2h_module.select(".st_row")
+    # Scoped specifically to .st_rmain (confirmed from a real saved page to
+    # contain ONLY genuine head-to-head rows, visible ones plus older ones
+    # hidden via the .hidd_stat CSS wrapper) rather than the whole module -
+    # if Forebet's module also holds an unrelated sub-section (e.g. a team's
+    # overall recent form against anyone, not specifically this opponent)
+    # reusing the same .st_row markup, this keeps that out.
+    rmain = h2h_module.select_one(".st_rmain")
+    rows = rmain.select(".st_row") if rmain else []
     if not rows:
         print(f"  H2H debug [{debug_label}]: H2H module found but contains zero rows "
               f"(likely these two teams have never met before - not a bug).")
