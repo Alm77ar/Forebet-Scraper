@@ -264,7 +264,7 @@ def _normalize_team_name(name):
     return name
 
 
-def parse_h2h_letters(page_html, candidate_team_name, debug_label=""):
+def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_results=10):
     """
     Parses a match detail page's "Head to head" module and returns a string
     of W/L/T letters (most recent first) from the perspective of
@@ -276,6 +276,15 @@ def parse_h2h_letters(page_html, candidate_team_name, debug_label=""):
     very slightly differently between the listing page and its own match
     page. debug_label is just for Action log messages so a silent empty
     result can be traced back to its match.
+
+    Forebet only shows the most recent ~5-6 meetings directly; older ones
+    (still real data, same chronological order) sit in a ".hidd_stat"
+    wrapper that's CSS-hidden by default rather than lazy-loaded via AJAX -
+    confirmed by inspecting a real saved page, where those extra rows were
+    already present in the static HTML. So selecting .st_row anywhere in
+    the module (not just direct children of .st_rmain) picks up all
+    available history with no extra clicking/waiting needed, up to
+    max_results entries (whatever's actually available, capped at 10).
     """
     soup = BeautifulSoup(page_html, "html.parser")
 
@@ -290,7 +299,7 @@ def parse_h2h_letters(page_html, candidate_team_name, debug_label=""):
         print(f"  H2H debug [{debug_label}]: no 'Head to head' module found on page at all.")
         return ""
 
-    rows = h2h_module.select(".st_rmain > .st_row")
+    rows = h2h_module.select(".st_row")
     if not rows:
         print(f"  H2H debug [{debug_label}]: H2H module found but contains zero rows "
               f"(likely these two teams have never met before - not a bug).")
@@ -301,7 +310,7 @@ def parse_h2h_letters(page_html, candidate_team_name, debug_label=""):
     unmatched_examples = []
 
     for row in rows:
-        if len(letters) >= 5:
+        if len(letters) >= max_results:
             break
 
         hteam_el = row.select_one(".st_hteam a")
