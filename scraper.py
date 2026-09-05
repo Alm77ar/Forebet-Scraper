@@ -379,26 +379,68 @@ async def fetch_h2h_for_picks(picks):
             if not url:
                 continue
             label = f"{item['home']} vs {item['away']}"
-            try:
-                print(f"Fetching H2H for: {label}")
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                # Wait for the H2H rows to actually be in the DOM rather than a flat
-                # sleep - the module can hydrate via AJAX on a delay, and a fixed
-                # wait was too short for some matches (this is what caused
-                # inconsistent results - some picks had H2H, some didn't).
+            print(f"Fetching H2H for: {label} ({url})")
+
+            h2h_result = ""
+            # Up to 2 attempts total: a transient Cloudflare interstitial or a
+            # slow server response on any single request can cause the whole
+            # "Head to head" module to be missing from that one page load,
+            # even though the same site/selectors work fine on every other
+            # match. A short retry resolves this far more reliably than any
+            # amount of extra diagnosis would.
+            # Up to 3 attempts total now: forebet.com's own backend occasionally
+            # returns a transient 502 Bad Gateway (confirmed independently by
+            # visiting the same match URL in a browser - Cloudflare itself was
+            # "Working", but forebet.com's own server showed "Error"). This is
+            # on their end, not bot-detection or our selectors, and a short
+            # retry is the correct fix for a random origin-server hiccup.
+            for attempt in range(1, 4):
                 try:
-                    await page.wait_for_function(
-                        "document.querySelectorAll('.st_rmain > .st_row').length > 0",
-                        timeout=8000,
-                    )
-                except Exception:
-                    # Legitimate for a genuine first-ever meeting between two teams.
-                    pass
-                content = await page.content()
-                h2h_map[url] = parse_h2h_letters(content, item["candidate_team"], debug_label=label)
-            except Exception as e:
-                print(f"Warning: H2H fetch failed for {url}, leaving blank: {e}")
-                h2h_map[url] = ""
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+                    if response is not None and response.status >= 400:
+                        print(f"  H2H debug [{label}] attempt {attempt}: page returned "
+                              f"HTTP {response.status} (likely a transient Forebet server "
+                              f"error, not a code issue).")
+                        if attempt < 3:
+                            await page.wait_for_timeout(3000)
+                            continue
+
+                    try:
+                        await page.wait_for_function(
+                            "document.querySelectorAll('.st_rmain > .st_row').length > 0",
+                            timeout=8000,
+                        )
+                    except Exception:
+                        # Legitimate for a genuine first-ever meeting between two teams.
+                        pass
+                    content = await page.content()
+
+                    if "Just a moment" in content or "cf-browser-verification" in content:
+                        print(f"  H2H debug [{label}] attempt {attempt}: hit a Cloudflare "
+                              f"interstitial instead of the real page.")
+                        if attempt < 3:
+                            await page.wait_for_timeout(2000)
+                            continue
+
+                    if "Bad gateway" in content:
+                        print(f"  H2H debug [{label}] attempt {attempt}: hit a 'Bad gateway' "
+                              f"error page (Forebet's own server, confirmed transient).")
+                        if attempt < 3:
+                            await page.wait_for_timeout(3000)
+                            continue
+
+                    h2h_result = parse_h2h_letters(content, item["candidate_team"], debug_label=label)
+                    if h2h_result or attempt == 3:
+                        break
+                    print(f"  H2H debug [{label}] attempt {attempt}: empty, retrying once...")
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    print(f"Warning: H2H fetch attempt {attempt} failed for {url}: {e}")
+                    if attempt < 3:
+                        await page.wait_for_timeout(1500)
+
+            h2h_map[url] = h2h_result
 
         await browser.close()
 
