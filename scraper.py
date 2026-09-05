@@ -264,7 +264,7 @@ def _normalize_team_name(name):
     return name
 
 
-def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_results=10):
+def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_results=8):
     """
     Parses a match detail page's "Head to head" module and returns a string
     of W/L/T letters (most recent first) from the perspective of
