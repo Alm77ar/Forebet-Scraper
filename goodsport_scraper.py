@@ -12,17 +12,45 @@ picks from multiple sources without caring which one produced them - the
 same "shared interface, separate implementation classes" pattern you'd get
 from separate .cs files implementing a common interface.
 
-NOTE: good-sport.co did not appear to be behind Cloudflare/FlareSolverr in
-initial testing (a plain requests.get() returned full prediction data), so
-this provider is intentionally lighter-weight than the Forebet one - no
-Playwright/FlareSolverr needed. If that turns out to be wrong in practice
-(e.g. intermittent challenge pages), the fetch step here is the only place
-that would need to grow FlareSolverr support to match forebet_scraper.py.
+Markup confirmed directly from a real saved copy of the listing page
+(the site's "today" page, checked 05 Sep 2026). It's built on the WordPress
+"Content Views" plugin, NOT Elementor cards - each match renders as:
 
-IMPORTANT: the selectors marked "ASSUMED" below are inferred from a
-markdown-rendered view of the page, not the real raw HTML class names.
-Confirm/fix them against a real saved HTML source (same way the Forebet
-H2H markup was confirmed) before relying on this in production.
+    <div class="pt-cv-content-item" data-pid="...">
+      <div class="pt-cv-specialp"><span class="terms">
+        <a ...>League Name</a>, <a ...>ZZZ-Today's Tips</a>
+      </span></div>
+      <h4 class="pt-cv-title"><a href="MATCH_URL">Home Team – Away Team</a></h4>
+      <div class="pt-cv-ctf-list">
+        ... one .pt-cv-custom-fields.pt-cv-ctf-NNN block per data point ...
+      </div>
+    </div>
+
+Each data point is a NUMBERED custom-field class rather than a
+semantically-named one, confirmed stable across every card sampled on the
+page:
+
+    pt-cv-ctf-002  -> kickoff time (e.g. "00:30")
+    pt-cv-ctf-016  -> home win probability   (e.g. "46%")
+    pt-cv-ctf-017  -> draw probability       (e.g. "35%")
+    pt-cv-ctf-018  -> away win probability   (e.g. "30%")
+    pt-cv-ctf-008  -> 1X2 pick               ("1" / "X" / "2")
+    pt-cv-ctf-009  -> Over/Under pick        ("O" / "U")
+    pt-cv-ctf-010  -> BTTS pick              ("Yes" / "No")
+    pt-cv-ctf-007  -> predicted correct score (e.g. "2:1")
+
+(ctf-040 through ctf-047 are just the repeated column-header labels
+"Time/1/X/2/1X2/U/O/BTTS/Score" baked into every card's markup - not data,
+safe to ignore.)
+
+No Cloudflare/FlareSolverr layer was needed in testing - a plain
+requests.get() on this same URL returned the full listing directly, so
+this provider is intentionally lighter-weight than the Forebet one. If
+that changes in practice, the fetch step below is the only place that
+would need FlareSolverr support added to match forebet_scraper.py.
+
+No odds or H2H data is exposed on this listing page, so those fields are
+always 0.0 / "" in the normalized output.
 """
 
 import re
@@ -64,7 +92,9 @@ class GoodSportScraper:
         """
         Fetches and filters picks for target_day ("today" or "tomorrow").
 
-        Returns a list of dicts in the SAME shape used by the Forebet
+        Returns a tuple: (picks, stats)
+
+        picks is a list of dicts in the SAME shape used by the Forebet
         provider, so scraper.py can merge lists from both sources before
         sorting/sending:
 
@@ -73,45 +103,128 @@ class GoodSportScraper:
                 "home": str,
                 "away": str,
                 "pick": str,             # e.g. "1 — Home win" / "2 — Away win"
-                "probability": int,      # the winning side's % (>= min_probability)
-                "coefficient": float,    # 0.0 - this site doesn't expose odds
-                "flag": "",              # not available on this site
+                "probability": int,      # winning side's % (>= min_probability)
+                "coefficient": 0.0,      # not exposed by this site
+                "flag": "",              # not exposed by this site
                 "league_tag": str,
-                "datetime": str,
+                "datetime": str,         # kickoff time as shown on the site
                 "match_url": str,
                 "candidate_team": str,   # team the probability applies to
-                "h2h": "",               # not available on this site
+                "h2h": "",               # not exposed by this site
+            }
+
+        stats is a dict of diagnostics mirroring the Forebet scraper's
+        stats shape, so pagination/parsing issues (e.g. only some of the
+        site's sub-pages actually getting fetched) are visible in the
+        Telegram diagnostics block instead of silently under-counting:
+
+            {
+                "pages_fetched": int,       # how many listing pages were requested
+                "pages_reported_by_site": int,  # total pages the site's own
+                                                 # pagination links claim to have
+                "raw_cards_detected": int,  # total .pt-cv-content-item found, all pages
+                "validated_parsed": int,    # cards that yielded usable home/away/% data
+                "skipped_no_data": int,     # cards that were detected but unparseable
+                "selected_picks": int,      # final picks meeting min_probability
             }
         """
         base_url = self.BASE_URLS.get(target_day, self.BASE_URLS["today"])
         all_cards = []
+        seen_pids = set()
         page_num = 1
+        pages_fetched = 0
+        pages_reported_by_site = 1
+        pagination_confirmed_working = False
 
         while page_num <= self.MAX_PAGES:
             page_url = base_url if page_num == 1 else f"{base_url}?_page={page_num}"
             html_content = self._fetch_page(page_url)
             if html_content is None:
+                print(f"GoodSportScraper: stopped at page {page_num} (fetch failed).")
                 break
+            pages_fetched += 1
 
             cards = self._parse_cards(html_content)
+            print(f"GoodSportScraper: page {page_num} ({page_url}) -> {len(cards)} cards")
             if not cards:
                 break
-            all_cards.extend(cards)
+
+            # IMPORTANT: this site's pagination (pages 2+) is loaded via AJAX
+            # (confirmed from real saved HTML: pt-cv-pagination has class
+            # "pt-cv-ajax" and there is no real ?_page=/  /page/ URL anywhere
+            # on the page). The ?_page=N query param used below is UNVERIFIED
+            # and likely does nothing, meaning page 2+ probably just re-serves
+            # page 1's identical content. Rather than silently duplicating
+            # results, detect that by comparing each card's data-pid against
+            # ones already seen - if a "new" page contributes zero new pids,
+            # stop immediately instead of looping MAX_PAGES times on the
+            # same 30-ish matches.
+            new_pids_this_page = 0
+            for card in cards:
+                pid = card.get("data-pid")
+                if pid and pid in seen_pids:
+                    continue
+                if pid:
+                    seen_pids.add(pid)
+                new_pids_this_page += 1
+                all_cards.append(card)
+
+            if page_num > 1 and new_pids_this_page == 0:
+                print(f"GoodSportScraper WARNING: page {page_num} returned ZERO new matches - "
+                      f"pagination via ?_page= is confirmed NOT working (site uses AJAX "
+                      f"pagination, not URL params). Stopping here. Only page 1's "
+                      f"{len(cards)} matches were actually retrieved this run - matches on "
+                      f"pages 2+ are being MISSED. See module docstring for how to fix.")
+                pages_fetched -= 1  # this fetch didn't actually get new data
+                break
+            elif page_num > 1:
+                pagination_confirmed_working = True
 
             total_pages = self._get_total_pages(html_content)
+            pages_reported_by_site = max(pages_reported_by_site, total_pages)
             if total_pages and page_num >= total_pages:
+                print(f"GoodSportScraper: reached last page ({total_pages} total per site pagination).")
                 break
             page_num += 1
+        else:
+            print(f"GoodSportScraper: hit MAX_PAGES safety cap ({self.MAX_PAGES}) - "
+                  f"site may have more pages than this. Raise MAX_PAGES if so.")
 
+        if pages_reported_by_site > 1 and not pagination_confirmed_working:
+            print(f"GoodSportScraper WARNING: site reports {pages_reported_by_site} total pages "
+                  f"but pagination could not be confirmed working - results below almost "
+                  f"certainly only cover page 1.")
+
+        raw_cards_detected = len(all_cards)
+        validated_parsed = 0
+        skipped_no_data = 0
         picks = []
+
         for card in all_cards:
-            card_data = self._card_to_pick(card)
+            card_data = self._card_to_data(card)
             if card_data is None:
+                skipped_no_data += 1
                 continue
+            validated_parsed += 1
             pick = self._to_pick_dict(card_data)
             if pick is not None:
                 picks.append(pick)
-        return picks
+
+        stats = {
+            "pages_fetched": pages_fetched,
+            "pages_reported_by_site": pages_reported_by_site,
+            "raw_cards_detected": raw_cards_detected,
+            "validated_parsed": validated_parsed,
+            "skipped_no_data": skipped_no_data,
+            "selected_picks": len(picks),
+        }
+
+        if pages_fetched < pages_reported_by_site:
+            print(f"GoodSportScraper WARNING: only fetched {pages_fetched} of "
+                  f"{pages_reported_by_site} pages the site reports - some matches "
+                  f"were likely missed. Check MAX_PAGES or pagination URL pattern.")
+
+        return picks, stats
 
     # ------------------------------------------------------------------ #
     # Fetching
@@ -136,55 +249,57 @@ class GoodSportScraper:
         return max_page
 
     # ------------------------------------------------------------------ #
-    # Parsing (ASSUMED selectors - confirm against real saved HTML)
+    # Parsing - confirmed selectors, see module docstring for the mapping
     # ------------------------------------------------------------------ #
 
     def _parse_cards(self, html_content):
-        """
-        Each match on the listing page renders as a card with:
-          - a title link "Team A – Team B" (real anchor, ASSUMED selector
-            below - ".elementor-post" is a common Elementor loop-item class
-            but MUST be confirmed against the real page source)
-          - a competition tag/link just above the card
-          - a small stats table: Time / 1 / X / 2 / 1X2 / U/O / BTTS / Score
-
-        Returns a list of BeautifulSoup card elements - one per match.
-        """
         soup = BeautifulSoup(html_content, "html.parser")
+        return soup.select(".pt-cv-content-item")
 
-        # ASSUMED: Elementor posts/loop-grid items. Replace with the real
-        # container class once confirmed from a saved HTML source.
-        cards = soup.select(".elementor-post, article, .jet-listing-grid__item")
-        return cards
+    def _ctf_value(self, card, ctf_number):
+        # IMPORTANT: real class names are zero-padded to 3 digits
+        # (pt-cv-ctf-016, pt-cv-ctf-008, pt-cv-ctf-002 ...) - confirmed
+        # directly from the real saved HTML. Passing a plain int without
+        # padding (e.g. "16" instead of "016") silently matches nothing.
+        el = card.select_one(f".pt-cv-ctf-{ctf_number:03d} .pt-cv-ctf-value")
+        return el.get_text(strip=True) if el else ""
 
-    def _card_to_pick(self, card):
-        title_el = card.select_one("h3 a, .elementor-post__title a, a[href*='/predictions/']")
+    def _card_to_data(self, card):
+        title_el = card.select_one("h4.pt-cv-title a")
         if not title_el:
             return None
 
         title_text = title_el.get_text(" ", strip=True)
         match_url = title_el.get("href", "")
 
-        # Titles look like "Team A – Team B" (en dash) on this site
+        # Titles use an en dash: "Home Team – Away Team"
         if "–" in title_text:
             home_team, away_team = [t.strip() for t in title_text.split("–", 1)]
-        elif "-" in title_text:
-            home_team, away_team = [t.strip() for t in title_text.split("-", 1)]
+        elif " - " in title_text:
+            home_team, away_team = [t.strip() for t in title_text.split(" - ", 1)]
         else:
             return None
 
-        league_el = card.find_previous(class_=re.compile("term|category|tag"))
-        league_tag = league_el.get_text(strip=True) if league_el else ""
+        # League/competition is the first term; site also tags every card
+        # with a "ZZZ-Today's/Tomorrow's Tips" housekeeping term - skip that one.
+        term_links = card.select(".pt-cv-specialp .terms a")
+        league_tag = ""
+        for a in term_links:
+            text = a.get_text(strip=True)
+            if not text.upper().startswith("ZZZ"):
+                league_tag = text
+                break
 
-        # Percentages: three consecutive "NN%" tokens = home / draw / away
-        text = card.get_text(" ", strip=True)
-        percentages = re.findall(r"(\d{1,3})%", text)
-        if len(percentages) < 3:
+        def pct(ctf_number):
+            raw = self._ctf_value(card, ctf_number)
+            m = re.search(r"\d+", raw)
+            return int(m.group()) if m else None
+
+        home_prob = pct(16)
+        draw_prob = pct(17)
+        away_prob = pct(18)
+        if home_prob is None or away_prob is None:
             return None
-        home_prob, draw_prob, away_prob = (int(p) for p in percentages[:3])
-
-        time_match = re.search(r"\b(\d{1,2}:\d{2})\b", text)
-        match_time = time_match.group(1) if time_match else ""
 
         return {
             "home_team": home_team,
@@ -193,7 +308,11 @@ class GoodSportScraper:
             "draw_prob": draw_prob,
             "away_prob": away_prob,
             "league_tag": league_tag,
-            "match_time": match_time,
+            "match_time": self._ctf_value(card, 2),
+            "onextwo_pick": self._ctf_value(card, 8),     # "1" / "X" / "2"
+            "over_under_pick": self._ctf_value(card, 9),  # "O" / "U"
+            "btts_pick": self._ctf_value(card, 10),       # "Yes" / "No"
+            "correct_score": self._ctf_value(card, 7),    # e.g. "2:1"
             "match_url": match_url,
         }
 
@@ -230,4 +349,9 @@ class GoodSportScraper:
             "match_url": card_data["match_url"],
             "candidate_team": candidate_team,
             "h2h": "",
+            # Extra fields this site uniquely offers, on top of the shared
+            # pick shape - safe for scraper.py to ignore if not needed.
+            "over_under_pick": card_data["over_under_pick"],
+            "btts_pick": card_data["btts_pick"],
+            "correct_score": card_data["correct_score"],
         }
