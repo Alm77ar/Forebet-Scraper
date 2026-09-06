@@ -6,6 +6,7 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from goodsport_scraper import GoodSportScraper
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -17,6 +18,7 @@ TARGET_URLS = {
 }
 
 MINIMUM_PROBABILITY = 75
+GOODSPORT_MINIMUM_PROBABILITY = 85
 
 # --- Tunables ---
 HYDRATION_TIMEOUT_MS = 40000
@@ -284,7 +286,7 @@ def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_result
     already present in the static HTML. So selecting .st_row anywhere in
     the module (not just direct children of .st_rmain) picks up all
     available history with no extra clicking/waiting needed, up to
-    max_results entries (whatever's actually available, capped at 10).
+    max_results entries (whatever's actually available, capped at 8).
     """
     soup = BeautifulSoup(page_html, "html.parser")
 
@@ -299,12 +301,6 @@ def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_result
         print(f"  H2H debug [{debug_label}]: no 'Head to head' module found on page at all.")
         return ""
 
-    # Scoped specifically to .st_rmain (confirmed from a real saved page to
-    # contain ONLY genuine head-to-head rows, visible ones plus older ones
-    # hidden via the .hidd_stat CSS wrapper) rather than the whole module -
-    # if Forebet's module also holds an unrelated sub-section (e.g. a team's
-    # overall recent form against anyone, not specifically this opponent)
-    # reusing the same .st_row markup, this keeps that out.
     rmain = h2h_module.select_one(".st_rmain")
     rows = rmain.select(".st_row") if rmain else []
     if not rows:
@@ -398,18 +394,6 @@ async def fetch_h2h_for_picks(picks):
             print(f"Fetching H2H for: {label} ({url})")
 
             h2h_result = ""
-            # Up to 2 attempts total: a transient Cloudflare interstitial or a
-            # slow server response on any single request can cause the whole
-            # "Head to head" module to be missing from that one page load,
-            # even though the same site/selectors work fine on every other
-            # match. A short retry resolves this far more reliably than any
-            # amount of extra diagnosis would.
-            # Up to 3 attempts total now: forebet.com's own backend occasionally
-            # returns a transient 502 Bad Gateway (confirmed independently by
-            # visiting the same match URL in a browser - Cloudflare itself was
-            # "Working", but forebet.com's own server showed "Error"). This is
-            # on their end, not bot-detection or our selectors, and a short
-            # retry is the correct fix for a random origin-server hiccup.
             for attempt in range(1, 4):
                 try:
                     response = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -428,7 +412,6 @@ async def fetch_h2h_for_picks(picks):
                             timeout=8000,
                         )
                     except Exception:
-                        # Legitimate for a genuine first-ever meeting between two teams.
                         pass
                     content = await page.content()
 
@@ -464,9 +447,6 @@ async def fetch_h2h_for_picks(picks):
 
 
 def format_h2h_boxes(h2h_str):
-    """
-    Compact colored letter badges formatted with wider spacing for a dedicated line.
-    """
     if not h2h_str:
         return ""
 
@@ -548,6 +528,7 @@ def scrape_forebet(target_day):
 
         results.append(
             {
+                "source": "Forebet",
                 "home": home_team,
                 "away": away_team,
                 "pick": pick,
@@ -630,11 +611,24 @@ if __name__ == "__main__":
     if target_day not in TARGET_URLS:
         target_day = "today"
 
-    picks, stats = scrape_forebet(target_day)
+    # --- Forebet ---
+    forebet_picks, stats = scrape_forebet(target_day)
+
+    # --- GoodSport ---
+    goodsport = GoodSportScraper(min_probability=GOODSPORT_MINIMUM_PROBABILITY)
+    goodsport_picks = goodsport.scrape(target_day)
+    print(f"2nd Src picks found: {len(goodsport_picks)}")
+
+    # --- Merge and sort by coefficient then probability ---
+    picks = sorted(
+        forebet_picks + goodsport_picks,
+        key=lambda item: (item["coefficient"], item["probability"]),
+        reverse=True,
+    )
 
     lines = [
-        f"⚽ <b>Forebet picks for {target_day.upper()}</b>",
-        f"<i>Filter: Win probability ≥ {MINIMUM_PROBABILITY}%</i>\n",
+        f"⚽ <b>Football picks for {target_day.upper()}</b>",
+        f"<i>Forebet: ≥{MINIMUM_PROBABILITY}% | GoodSport: ≥{GOODSPORT_MINIMUM_PROBABILITY}%</i>\n",
     ]
 
     if picks:
@@ -644,6 +638,7 @@ if __name__ == "__main__":
             home = html.escape(item["home"])
             away = html.escape(item["away"])
             pick_text = html.escape(item["pick"])
+            source_label = " <i>(GoodSport)</i>" if item.get("source") == "GoodSport" else ""
 
             meta_parts = [b for b in [item["flag"], html.escape(item["league_tag"]), html.escape(item["datetime"])] if b]
             meta_str = " • ".join(meta_parts)
@@ -653,7 +648,7 @@ if __name__ == "__main__":
             else:
                 lines.append(f"{dot}")
 
-            lines.append(f"<b>{home} vs {away}</b>")
+            lines.append(f"<b>{home} vs {away}</b>{source_label}")
             lines.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
 
             if item.get("h2h"):
@@ -668,10 +663,11 @@ if __name__ == "__main__":
 
     lines.append("---")
     lines.append("📊 <b>Validation Diagnostics:</b>")
-    lines.append(f"• Match nodes detected in DOM: {stats['raw_detected']}")
-    lines.append(f"• Validated match rows parsed: {stats['validated_parsed']}")
-    lines.append(f"• Rows skipped (no valid container found): {stats['skipped_no_container']}")
-    lines.append(f"• Picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
+    lines.append(f"• Forebet match nodes detected in DOM: {stats['raw_detected']}")
+    lines.append(f"• Forebet validated match rows parsed: {stats['validated_parsed']}")
+    lines.append(f"• Forebet rows skipped (no valid container): {stats['skipped_no_container']}")
+    lines.append(f"• Forebet picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
+    lines.append(f"• GoodSport picks meeting criteria (≥{GOODSPORT_MINIMUM_PROBABILITY}%): {len(goodsport_picks)}")
 
     message = "\n".join(lines)
     send_telegram_message(message)
