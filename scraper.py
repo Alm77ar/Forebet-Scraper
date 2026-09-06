@@ -621,46 +621,81 @@ if __name__ == "__main__":
     print(f"GoodSport stats: {goodsport_stats}")
 
     # --- Merge and sort by coefficient then probability ---
-    picks = sorted(
+    merged_picks = sorted(
         forebet_picks + goodsport_picks,
         key=lambda item: (item["coefficient"], item["probability"]),
         reverse=True,
     )
+
+    def format_pick_lines(item):
+        """
+        Builds the block of lines for a single pick. Always shows which
+        source ("Forebet" / "GoodSport") the pick came from - not just
+        GoodSport as before - and always renders the H2H block whenever
+        h2h data is present on the item (Forebet only; GoodSport doesn't
+        expose H2H, so item["h2h"] is always "" there and the block is
+        skipped for those picks, same as before).
+        """
+        block = []
+
+        coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
+        dot = probability_emoji(item["probability"])
+        home = html.escape(item["home"])
+        away = html.escape(item["away"])
+        pick_text = html.escape(item["pick"])
+        source_tag = html.escape(item.get("source", "Unknown"))
+
+        meta_parts = [b for b in [item.get("flag", ""), html.escape(item.get("league_tag", "")), html.escape(item.get("datetime", ""))] if b]
+        meta_str = " • ".join(meta_parts)
+
+        if meta_str:
+            block.append(f"{dot} {meta_str}")
+        else:
+            block.append(f"{dot}")
+
+        block.append(f"<b>{home} vs {away}</b>  <i>[{source_tag}]</i>")
+        block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
+
+        if item.get("h2h"):
+            candidate = html.escape(item["candidate_team"])
+            h2h_formatted = format_h2h_boxes(item["h2h"])
+            block.append(f"📊 H2H ({candidate}):")
+            block.append(f"{h2h_formatted}\n")
+        else:
+            block.append("")
+
+        return block
 
     lines = [
         f"⚽ <b>Football picks for {target_day.upper()}</b>",
         f"<i>Forebet: ≥{MINIMUM_PROBABILITY}% | GoodSport: ≥{GOODSPORT_MINIMUM_PROBABILITY}%</i>\n",
     ]
 
-    if picks:
-        for item in picks:
-            coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
-            dot = probability_emoji(item["probability"])
-            home = html.escape(item["home"])
-            away = html.escape(item["away"])
-            pick_text = html.escape(item["pick"])
-            source_label = " <i>(GoodSport)</i>" if item.get("source") == "GoodSport" else ""
-
-            meta_parts = [b for b in [item["flag"], html.escape(item["league_tag"]), html.escape(item["datetime"])] if b]
-            meta_str = " • ".join(meta_parts)
-
-            if meta_str:
-                lines.append(f"{dot} {meta_str}")
-            else:
-                lines.append(f"{dot}")
-
-            lines.append(f"<b>{home} vs {away}</b>{source_label}")
-            lines.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
-
-            if item.get("h2h"):
-                candidate = html.escape(item["candidate_team"])
-                h2h_formatted = format_h2h_boxes(item["h2h"])
-                lines.append(f"📊 H2H ({candidate}):")
-                lines.append(f"{h2h_formatted}\n")
-            else:
-                lines.append("")
+    # --- Section 1: Merged (both sources together, sorted) ---
+    lines.append("🔀 <b>MERGED — ALL SOURCES</b>\n")
+    if merged_picks:
+        for item in merged_picks:
+            lines.extend(format_pick_lines(item))
     else:
         lines.append("No matches found matching criteria.\n")
+
+    # --- Section 2: Forebet only ---
+    lines.append("---")
+    lines.append("🟢 <b>FOREBET ONLY</b>\n")
+    if forebet_picks:
+        for item in forebet_picks:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No Forebet matches found matching criteria.\n")
+
+    # --- Section 3: GoodSport only ---
+    lines.append("---")
+    lines.append("🔵 <b>GOODSPORT ONLY</b>\n")
+    if goodsport_picks:
+        for item in goodsport_picks:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No GoodSport matches found matching criteria.\n")
 
     lines.append("---")
     lines.append("📊 <b>Validation Diagnostics:</b>")
