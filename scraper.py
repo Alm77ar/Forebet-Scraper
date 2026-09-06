@@ -616,8 +616,9 @@ if __name__ == "__main__":
 
     # --- GoodSport ---
     goodsport = GoodSportScraper(min_probability=GOODSPORT_MINIMUM_PROBABILITY)
-    goodsport_picks = goodsport.scrape(target_day)
-    print(f"2nd Src picks found: {len(goodsport_picks)}")
+    goodsport_picks, goodsport_stats = goodsport.scrape(target_day)
+    print(f"GoodSport picks found: {len(goodsport_picks)}")
+    print(f"GoodSport stats: {goodsport_stats}")
 
     # --- Merge and sort by coefficient then probability ---
     picks = sorted(
@@ -667,7 +668,15 @@ if __name__ == "__main__":
     lines.append(f"• Forebet validated match rows parsed: {stats['validated_parsed']}")
     lines.append(f"• Forebet rows skipped (no valid container): {stats['skipped_no_container']}")
     lines.append(f"• Forebet picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
-    lines.append(f"• GoodSport picks meeting criteria (≥{GOODSPORT_MINIMUM_PROBABILITY}%): {len(goodsport_picks)}")
+    lines.append(f"• GoodSport pages fetched: {goodsport_stats['pages_fetched']} "
+                 f"(site reports {goodsport_stats['pages_reported_by_site']} total)")
+    lines.append(f"• GoodSport raw match cards detected: {goodsport_stats['raw_cards_detected']}")
+    lines.append(f"• GoodSport validated match rows parsed: {goodsport_stats['validated_parsed']}")
+    lines.append(f"• GoodSport rows skipped (no valid data): {goodsport_stats['skipped_no_data']}")
+    lines.append(f"• GoodSport picks meeting criteria (≥{GOODSPORT_MINIMUM_PROBABILITY}%): {goodsport_stats['selected_picks']}")
+    if goodsport_stats['pages_fetched'] < goodsport_stats['pages_reported_by_site']:
+        lines.append(f"⚠️ <b>GoodSport pagination likely broken - only page 1 was retrieved. "
+                      f"See Action logs for details.</b>")
 
     message = "\n".join(lines)
     send_telegram_message(message)
