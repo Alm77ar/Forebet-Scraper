@@ -17,8 +17,14 @@ TARGET_URLS = {
     "tomorrow": "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow",
 }
 
+OVER_UNDER_URLS = {
+    "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today/predictions-under-over-goals",
+    "tomorrow": "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow/under-over-25-goals",
+}
+
 MINIMUM_PROBABILITY = 75
 GOODSPORT_MINIMUM_PROBABILITY = 85
+OVER_UNDER_MINIMUM_PROBABILITY = 80
 
 # --- Tunables ---
 HYDRATION_TIMEOUT_MS = 40000
@@ -564,6 +570,119 @@ def scrape_forebet(target_day):
     return sorted_results, stats
 
 
+def scrape_forebet_over_under(target_day):
+    """
+    Scrapes Forebet's dedicated Over/Under 2.5 goals page - a SEPARATE page
+    from the main 1X2 predictions page, with different markup for the
+    probability block:
+
+        Main 1X2 page:  <div class="fprc"><span>H</span><span>D</span>
+                          <span class="fpr">A</span></div>   (3 spans)
+        This O/U page:  <div class="fprc"><span>Under%</span>
+                          <span>Over%</span></div>            (2 spans)
+
+    IMPORTANT: the "fpr" highlight class is NOT reliably tied to Over vs
+    Under - confirmed from real saved HTML for both "today" and "tomorrow":
+    Forebet moves the "fpr" class onto whichever of the two values is
+    higher/predicted (sometimes Under, sometimes Over), not onto a fixed
+    position. Position is what's fixed: span[0] is always Under%, span[1]
+    is always Over%, regardless of which one carries the "fpr" class. This
+    parser reads by position only, never by the "fpr" class, so it is not
+    affected by that swap.
+
+    Reuses the same FlareSolverr+Playwright fetch/scroll/hydrate pipeline
+    as scrape_forebet() (fetch_full_html), since this page sits behind the
+    same Cloudflare protection and uses the same span[onclick*='ltodrows']
+    "More" button mechanism to reveal additional matches.
+
+    Only returns matches with Over 2.5 probability >= OVER_UNDER_MINIMUM_PROBABILITY.
+    """
+    url = OVER_UNDER_URLS.get(target_day, OVER_UNDER_URLS["today"])
+    html_content = asyncio.run(fetch_full_html(url, run_label=f"{target_day}_ou"))
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    rows = soup.select(".rcnt")
+    raw_detected_count = len(rows)
+
+    results = []
+    seen_matches = set()
+    validated_count = 0
+    skipped_wrong_layout = 0
+
+    for row in rows:
+        home_el = row.select_one(".homeTeam")
+        away_el = row.select_one(".awayTeam")
+        if not home_el or not away_el:
+            continue
+
+        home_team = home_el.get_text(" ", strip=True)
+        away_team = away_el.get_text(" ", strip=True)
+
+        match_key = (home_team, away_team)
+        if match_key in seen_matches:
+            continue
+        seen_matches.add(match_key)
+
+        fprc = row.select_one(".fprc")
+        if not fprc:
+            continue
+        spans = fprc.select("span")
+        if len(spans) != 2:
+            # Wrong layout (3 spans = the 1X2 page, not O/U) - most likely
+            # cause is a wrong/unconfirmed URL for this target_day.
+            skipped_wrong_layout += 1
+            continue
+
+        try:
+            under_prob = int(spans[0].get_text(strip=True))
+            over_prob = int(spans[1].get_text(strip=True))
+        except ValueError:
+            continue
+
+        validated_count += 1
+
+        if over_prob < OVER_UNDER_MINIMUM_PROBABILITY:
+            continue
+
+        odds_el = row.select_one(".bigOnly.prmod .lscrsp")
+        odds_text = odds_el.get_text(strip=True) if odds_el else ""
+        coefficient = 0.0
+        if odds_text and odds_text not in ("-", "no"):
+            try:
+                coefficient = float(odds_text)
+            except ValueError:
+                coefficient = 0.0
+
+        flag_code, league_tag, match_datetime, match_url = extract_match_meta(row)
+
+        results.append(
+            {
+                "source": "Forebet O/U",
+                "home": home_team,
+                "away": away_team,
+                "pick": "Over 2.5 goals",
+                "probability": over_prob,
+                "coefficient": coefficient,
+                "flag": flag_emoji(flag_code),
+                "league_tag": league_tag,
+                "datetime": match_datetime,
+                "match_url": match_url,
+                "candidate_team": "",
+                "h2h": "",
+            }
+        )
+
+    stats = {
+        "raw_detected": raw_detected_count,
+        "validated_parsed": validated_count,
+        "skipped_wrong_layout": skipped_wrong_layout,
+        "selected_picks": len(results),
+    }
+
+    sorted_results = sorted(results, key=lambda item: item["probability"], reverse=True)
+    return sorted_results, stats
+
+
 def probability_emoji(prob):
     if prob >= 90:
         return "🟢"
@@ -619,6 +738,11 @@ if __name__ == "__main__":
     goodsport_picks, goodsport_stats = goodsport.scrape(target_day)
     print(f"GoodSport picks found: {len(goodsport_picks)}")
     print(f"GoodSport stats: {goodsport_stats}")
+
+    # --- Forebet Over/Under 2.5 ---
+    over_under_picks, ou_stats = scrape_forebet_over_under(target_day)
+    print(f"Over/Under 2.5 picks found: {len(over_under_picks)}")
+    print(f"Over/Under stats: {ou_stats}")
 
     # --- Match the same fixture across both sources ---
     # A match is considered "the same" if its home+away team names match
@@ -738,6 +862,15 @@ if __name__ == "__main__":
     else:
         lines.append("No additional GoodSport-only matches.\n")
 
+    # --- Section 4: Over/Under 2.5 goals ---
+    lines.append("---")
+    lines.append(f"🥅 <b>OVER 2.5 GOALS ≥{OVER_UNDER_MINIMUM_PROBABILITY}%</b>\n")
+    if over_under_picks:
+        for item in over_under_picks:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No Over 2.5 matches found matching criteria.\n")
+
     lines.append("---")
     lines.append("📊 <b>Validation Diagnostics:</b>")
     lines.append(f"• Forebet match nodes detected in DOM: {stats['raw_detected']}")
@@ -751,6 +884,13 @@ if __name__ == "__main__":
     lines.append(f"• GoodSport rows skipped (no valid data): {goodsport_stats['skipped_no_data']}")
     lines.append(f"• GoodSport picks meeting criteria (≥{GOODSPORT_MINIMUM_PROBABILITY}%): {goodsport_stats['selected_picks']}")
     lines.append(f"• Matches confirmed by both sources: {len(merged_picks)}")
+    lines.append(f"• Over/Under 2.5 rows detected: {ou_stats['raw_detected']}")
+    lines.append(f"• Over/Under 2.5 rows validated: {ou_stats['validated_parsed']}")
+    lines.append(f"• Over/Under 2.5 rows skipped (wrong page layout): {ou_stats['skipped_wrong_layout']}")
+    lines.append(f"• Over/Under 2.5 picks meeting criteria (≥{OVER_UNDER_MINIMUM_PROBABILITY}%): {ou_stats['selected_picks']}")
+    if ou_stats['skipped_wrong_layout'] > 0:
+        lines.append(f"⚠️ <b>Over/Under page returned the wrong layout ({ou_stats['skipped_wrong_layout']} rows) - "
+                      f"the '{target_day}' O/U URL is likely wrong. Check OVER_UNDER_URLS.</b>")
     if goodsport_stats['pages_fetched'] < goodsport_stats['pages_reported_by_site']:
         lines.append(f"⚠️ <b>GoodSport pagination likely broken - only page 1 was retrieved. "
                       f"See Action logs for details.</b>")
