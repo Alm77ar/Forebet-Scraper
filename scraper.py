@@ -815,11 +815,11 @@ if __name__ == "__main__":
         if "goodsport_probability" in item:
             block.append(
                 f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | "
-                f"📈 Coef: <code>{coef_str}</code> | "
+                f"<code>📈 Coef: {coef_str}</code> | "
                 f"GoodSport: <b>{item['goodsport_probability']}%</b> ({html.escape(item['goodsport_pick'])})"
             )
         else:
-            block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
+            block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | <code>📈 Coef: {coef_str}</code>")
 
         if item.get("h2h"):
             candidate = html.escape(item["candidate_team"])
@@ -846,7 +846,7 @@ if __name__ == "__main__":
 
     # --- Section 2: Forebet only (not also found by GoodSport) ---
     lines.append("---")
-    lines.append("🟢 <b>FOREBET ONLY</b>\n")
+    lines.append("🅵 <b>FOREBET ONLY</b>\n")
     if forebet_only:
         for item in forebet_only:
             lines.extend(format_pick_lines(item))
@@ -855,7 +855,7 @@ if __name__ == "__main__":
 
     # --- Section 3: GoodSport only (not also found by Forebet) ---
     lines.append("---")
-    lines.append("🔵 <b>GOODSPORT ONLY</b>\n")
+    lines.append("🅶 <b>GOODSPORT ONLY</b>\n")
     if goodsport_only:
         for item in goodsport_only:
             lines.extend(format_pick_lines(item))
