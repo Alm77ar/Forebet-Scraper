@@ -837,7 +837,7 @@ if __name__ == "__main__":
     ]
 
     # --- Section 1: Merged (same fixture confirmed by both sources) ---
-    lines.append("🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b>\n")
+    lines.append("<blockquote>━━━━━ 🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━━━━━</blockquote>\n")
     if merged_picks:
         for item in merged_picks:
             lines.extend(format_pick_lines(item))
@@ -845,8 +845,7 @@ if __name__ == "__main__":
         lines.append("No matches were found by both sources.\n")
 
     # --- Section 2: Forebet only (not also found by GoodSport) ---
-    lines.append("---")
-    lines.append("🅵 <b>FOREBET ONLY</b>\n")
+    lines.append("<blockquote>━━━━━ 🅵 <b>FOREBET ONLY</b> ━━━━━</blockquote>\n")
     if forebet_only:
         for item in forebet_only:
             lines.extend(format_pick_lines(item))
@@ -854,8 +853,7 @@ if __name__ == "__main__":
         lines.append("No additional Forebet-only matches.\n")
 
     # --- Section 3: GoodSport only (not also found by Forebet) ---
-    lines.append("---")
-    lines.append("🅶 <b>GOODSPORT ONLY</b>\n")
+    lines.append("<blockquote>━━━━━ 🅶 <b>GOODSPORT ONLY</b> ━━━━━</blockquote>\n")
     if goodsport_only:
         for item in goodsport_only:
             lines.extend(format_pick_lines(item))
@@ -863,16 +861,14 @@ if __name__ == "__main__":
         lines.append("No additional GoodSport-only matches.\n")
 
     # --- Section 4: Over/Under 2.5 goals ---
-    lines.append("---")
-    lines.append(f"🥅 <b>OVER 2.5 GOALS ≥{OVER_UNDER_MINIMUM_PROBABILITY}%</b>\n")
+    lines.append(f"<blockquote>━━━━━ 🥅 <b>OVER 2.5 GOALS ≥{OVER_UNDER_MINIMUM_PROBABILITY}%</b> ━━━━━</blockquote>\n")
     if over_under_picks:
         for item in over_under_picks:
             lines.extend(format_pick_lines(item))
     else:
         lines.append("No Over 2.5 matches found matching criteria.\n")
 
-    lines.append("---")
-    lines.append("📊 <b>Validation Diagnostics:</b>")
+    lines.append("<blockquote>━━━━━ 📊 <b>VALIDATION DIAGNOSTICS</b> ━━━━━</blockquote>\n")
     lines.append(f"• Forebet match nodes detected in DOM: {stats['raw_detected']}")
     lines.append(f"• Forebet validated match rows parsed: {stats['validated_parsed']}")
     lines.append(f"• Forebet rows skipped (no valid container): {stats['skipped_no_container']}")
