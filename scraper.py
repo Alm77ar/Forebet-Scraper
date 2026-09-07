@@ -620,21 +620,54 @@ if __name__ == "__main__":
     print(f"GoodSport picks found: {len(goodsport_picks)}")
     print(f"GoodSport stats: {goodsport_stats}")
 
-    # --- Merge and sort by coefficient then probability ---
-    merged_picks = sorted(
-        forebet_picks + goodsport_picks,
-        key=lambda item: (item["coefficient"], item["probability"]),
-        reverse=True,
-    )
+    # --- Match the same fixture across both sources ---
+    # A match is considered "the same" if its home+away team names match
+    # after normalization (reusing the same loose name-matching used for
+    # H2H, since team spelling can differ slightly source to source).
+    # Matched fixtures become ONE merged entry (built from the Forebet
+    # pick - keeps coefficient + H2H - with GoodSport's probability
+    # attached) and are removed from both single-source lists below, so
+    # nothing appears twice across the three sections.
+    def fixture_key(item):
+        return frozenset({_normalize_team_name(item["home"]), _normalize_team_name(item["away"])})
+
+    goodsport_by_fixture = {}
+    for gs_item in goodsport_picks:
+        goodsport_by_fixture[fixture_key(gs_item)] = gs_item
+
+    merged_picks = []
+    forebet_only = []
+    matched_goodsport_keys = set()
+
+    for fb_item in forebet_picks:
+        key = fixture_key(fb_item)
+        gs_match = goodsport_by_fixture.get(key)
+        if gs_match:
+            merged_item = dict(fb_item)  # keeps coefficient, h2h, candidate_team, etc.
+            merged_item["source"] = "Forebet + GoodSport"
+            merged_item["goodsport_probability"] = gs_match["probability"]
+            merged_item["goodsport_pick"] = gs_match["pick"]
+            merged_picks.append(merged_item)
+            matched_goodsport_keys.add(key)
+        else:
+            forebet_only.append(fb_item)
+
+    goodsport_only = [
+        gs_item for gs_item in goodsport_picks
+        if fixture_key(gs_item) not in matched_goodsport_keys
+    ]
+
+    merged_picks.sort(key=lambda item: (item["coefficient"], item["probability"]), reverse=True)
+    forebet_only.sort(key=lambda item: (item["coefficient"], item["probability"]), reverse=True)
+    goodsport_only.sort(key=lambda item: item["probability"], reverse=True)
 
     def format_pick_lines(item):
         """
-        Builds the block of lines for a single pick. Always shows which
-        source ("Forebet" / "GoodSport") the pick came from - not just
-        GoodSport as before - and always renders the H2H block whenever
-        h2h data is present on the item (Forebet only; GoodSport doesn't
-        expose H2H, so item["h2h"] is always "" there and the block is
-        skipped for those picks, same as before).
+        Builds the block of lines for a single pick. Shows which source(s)
+        the pick came from, and ALWAYS renders the H2H block whenever
+        item["h2h"] is present - merged items carry this over from their
+        Forebet half, since scrape_forebet() already populated it before
+        this script ever touches the list; nothing here strips it.
         """
         block = []
 
@@ -654,7 +687,15 @@ if __name__ == "__main__":
             block.append(f"{dot}")
 
         block.append(f"<b>{home} vs {away}</b>  <i>[{source_tag}]</i>")
-        block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
+
+        if "goodsport_probability" in item:
+            block.append(
+                f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | "
+                f"📈 Coef: <code>{coef_str}</code> | "
+                f"GoodSport: <b>{item['goodsport_probability']}%</b> ({html.escape(item['goodsport_pick'])})"
+            )
+        else:
+            block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | 📈 Coef: <code>{coef_str}</code>")
 
         if item.get("h2h"):
             candidate = html.escape(item["candidate_team"])
@@ -671,31 +712,31 @@ if __name__ == "__main__":
         f"<i>Forebet: ≥{MINIMUM_PROBABILITY}% | GoodSport: ≥{GOODSPORT_MINIMUM_PROBABILITY}%</i>\n",
     ]
 
-    # --- Section 1: Merged (both sources together, sorted) ---
-    lines.append("🔀 <b>MERGED — ALL SOURCES</b>\n")
+    # --- Section 1: Merged (same fixture confirmed by both sources) ---
+    lines.append("🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b>\n")
     if merged_picks:
         for item in merged_picks:
             lines.extend(format_pick_lines(item))
     else:
-        lines.append("No matches found matching criteria.\n")
+        lines.append("No matches were found by both sources.\n")
 
-    # --- Section 2: Forebet only ---
+    # --- Section 2: Forebet only (not also found by GoodSport) ---
     lines.append("---")
     lines.append("🟢 <b>FOREBET ONLY</b>\n")
-    if forebet_picks:
-        for item in forebet_picks:
+    if forebet_only:
+        for item in forebet_only:
             lines.extend(format_pick_lines(item))
     else:
-        lines.append("No Forebet matches found matching criteria.\n")
+        lines.append("No additional Forebet-only matches.\n")
 
-    # --- Section 3: GoodSport only ---
+    # --- Section 3: GoodSport only (not also found by Forebet) ---
     lines.append("---")
     lines.append("🔵 <b>GOODSPORT ONLY</b>\n")
-    if goodsport_picks:
-        for item in goodsport_picks:
+    if goodsport_only:
+        for item in goodsport_only:
             lines.extend(format_pick_lines(item))
     else:
-        lines.append("No GoodSport matches found matching criteria.\n")
+        lines.append("No additional GoodSport-only matches.\n")
 
     lines.append("---")
     lines.append("📊 <b>Validation Diagnostics:</b>")
@@ -709,6 +750,7 @@ if __name__ == "__main__":
     lines.append(f"• GoodSport validated match rows parsed: {goodsport_stats['validated_parsed']}")
     lines.append(f"• GoodSport rows skipped (no valid data): {goodsport_stats['skipped_no_data']}")
     lines.append(f"• GoodSport picks meeting criteria (≥{GOODSPORT_MINIMUM_PROBABILITY}%): {goodsport_stats['selected_picks']}")
+    lines.append(f"• Matches confirmed by both sources: {len(merged_picks)}")
     if goodsport_stats['pages_fetched'] < goodsport_stats['pages_reported_by_site']:
         lines.append(f"⚠️ <b>GoodSport pagination likely broken - only page 1 was retrieved. "
                       f"See Action logs for details.</b>")
