@@ -837,7 +837,7 @@ if __name__ == "__main__":
     ]
 
     # --- Section 1: Merged (same fixture confirmed by both sources) ---
-    lines.append("<blockquote>━ 🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━</blockquote>\n")
+    lines.append("<blockquote>━━━━━ 🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━━━━━</blockquote>\n")
     if merged_picks:
         for item in merged_picks:
             lines.extend(format_pick_lines(item))
@@ -868,7 +868,7 @@ if __name__ == "__main__":
     else:
         lines.append("No Over 2.5 matches found matching criteria.\n")
 
-    lines.append("<blockquote>━ 📊 <b>VALIDATION DIAGNOSTICS</b> ━</blockquote>\n")
+    lines.append("<blockquote>━━━━━ 📊 <b>VALIDATION DIAGNOSTICS</b> ━━━━━</blockquote>\n")
     lines.append(f"• Forebet match nodes detected in DOM: {stats['raw_detected']}")
     lines.append(f"• Forebet validated match rows parsed: {stats['validated_parsed']}")
     lines.append(f"• Forebet rows skipped (no valid container): {stats['skipped_no_container']}")
