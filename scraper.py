@@ -1,65 +1,301 @@
 import os
+import re
 import sys
 import html
-import re
 import asyncio
 import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from goodsport_scraper import GoodSportScraper
 
-# ==========================================
-# 1. HELPER & NORMALIZATION FUNCTIONS
-# ==========================================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://localhost:8191/v1")
 
-def _normalize_team_name(name: str) -> str:
-    """
-    Strips punctuation and standardizes spaces to catch variations
-    like 'Al-Nassr' vs 'Al Nassr'.
-    """
-    if not name:
-        return ""
-    name = name.strip().lower()
-    name = re.sub(r"[-_.]", " ", name)
-    name = re.sub(r"\s+", " ", name)
-    return name.strip()
+TARGET_URLS = {
+    "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today",
+    "tomorrow": "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow",
+}
+
+OVER_UNDER_URLS = {
+    "today": "https://www.forebet.com/en/football-tips-and-predictions-for-today/predictions-under-over-goals",
+    "tomorrow": "https://www.forebet.com/en/football-tips-and-predictions-for-tomorrow/under-over-25-goals",
+}
+
+MINIMUM_PROBABILITY = 75
+GOODSPORT_MINIMUM_PROBABILITY = 85
+OVER_UNDER_MINIMUM_PROBABILITY = 80
+
+# --- Tunables ---
+HYDRATION_TIMEOUT_MS = 40000
+MAX_SCROLL_STEPS = 45
+SCROLL_PAUSE_MS = 700
+STAGNATION_STEPS_REQUIRED = 10
+DEBUG_DIR = "debug_artifacts"
 
 
-def send_telegram_sync(bot_token: str, chat_id: str, message: str) -> bool:
-    """
-    Synchronous Telegram dispatcher using the 'requests' library.
-    """
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+def get_flaresolverr_clearance(url):
     payload = {
-        "chat_id": chat_id,
-        "text": html.unescape(message),
-        "parse_mode": "HTML"
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": 60000,
     }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"Telegram dispatch error: {e}", file=sys.stderr)
-        return False
+    headers = {"Content-Type": "application/json"}
+
+    print(f"Requesting Cloudflare clearance via FlareSolverr: {url}")
+    response = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=70)
+    response.raise_for_status()
+
+    data = response.json()
+    if data.get("status") == "ok":
+        solution = data["solution"]
+        return solution.get("cookies", []), solution.get("userAgent", "")
+
+    raise RuntimeError(f"FlareSolverr clearance failed: {data.get('message')}")
 
 
-# ==========================================
-# 2. FOREBET PARSING LOGIC
-# ==========================================
+async def click_all_more_buttons(page):
+    clicked = 0
+    buttons = await page.query_selector_all(
+        "#btn_more, .schema-more, a[id*='more'], button[id*='more'], "
+        "span[onclick*='ltodrows']"
+    )
+    for btn in buttons:
+        try:
+            if await btn.is_visible():
+                await btn.click(timeout=2000)
+                clicked += 1
+                await page.wait_for_timeout(600)
+        except Exception:
+            continue
+    return clicked
 
-def parse_h2h_letters(
-    page_html: str,
-    candidate_team_name: str,
-    opponent_team_name: str = "",
-    debug_label: str = "",
-    max_results: int = 8,
-) -> str:
+
+async def fetch_full_html(url, run_label="run"):
+    cookies, user_agent = get_flaresolverr_clearance(url)
+
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    step_counts = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        pw_cookies = [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c["domain"],
+                "path": c.get("path", "/"),
+            }
+            for c in cookies
+        ]
+
+        context = await browser.new_context(
+            user_agent=user_agent,
+            viewport={"width": 1440, "height": 900},
+        )
+        await context.add_cookies(pw_cookies)
+
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
+        page = await context.new_page()
+
+        print(f"Navigating to match table: {url}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+        try:
+            await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_00_initial.png", full_page=True, timeout=60000)
+        except Exception as e:
+            print(f"Warning: initial debug screenshot failed/timed out, continuing anyway: {e}")
+
+        try:
+            await page.wait_for_function(
+                "document.querySelectorAll('.homeTeam, [class*=\"homeTeam\"]').length > 10",
+                timeout=HYDRATION_TIMEOUT_MS,
+            )
+            print("Match list hydrated successfully.")
+        except Exception:
+            print("Warning: Initial hydration timeout reached. Continuing with incremental scroll...")
+
+        print("Executing incremental step scrolling...")
+        last_count = 0
+        stagnant_steps = 0
+
+        for step in range(MAX_SCROLL_STEPS):
+            await page.evaluate("window.scrollBy(0, 800);")
+            await page.wait_for_timeout(SCROLL_PAUSE_MS)
+
+            clicked = await click_all_more_buttons(page)
+
+            current_count = await page.locator(".homeTeam, [class*='homeTeam']").count()
+            step_counts.append(current_count)
+
+            print(
+                f"  step {step:02d}: matches_detected={current_count} "
+                f"more_buttons_clicked={clicked} stagnant_steps={stagnant_steps}"
+            )
+
+            if current_count == last_count and current_count > 15:
+                stagnant_steps += 1
+                if stagnant_steps >= STAGNATION_STEPS_REQUIRED:
+                    print(f"Scroll complete: Captured {current_count} matches "
+                          f"(stagnant for {STAGNATION_STEPS_REQUIRED} steps).")
+                    break
+            else:
+                stagnant_steps = 0
+                last_count = current_count
+        else:
+            print(f"Reached MAX_SCROLL_STEPS ({MAX_SCROLL_STEPS}) without full stagnation; "
+                  f"stopping with {last_count} matches.")
+
+        try:
+            await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=True, timeout=90000)
+        except Exception as e:
+            print(f"Warning: full-page final screenshot failed ({e}), trying viewport fallback...")
+            try:
+                await page.screenshot(path=f"{DEBUG_DIR}/{run_label}_01_final.png", full_page=False, timeout=30000)
+            except Exception as e2:
+                print(f"Warning: viewport screenshot failed, skipping final screenshot: {e2}")
+
+        content = await page.content()
+        with open(f"{DEBUG_DIR}/{run_label}_final.html", "w", encoding="utf-8") as f:
+            f.write(content)
+        with open(f"{DEBUG_DIR}/{run_label}_step_counts.txt", "w") as f:
+            f.write("step,matches_detected\n")
+            for i, c in enumerate(step_counts):
+                f.write(f"{i},{c}\n")
+
+        await browser.close()
+        return content
+
+
+def extract_probabilities_from_container(container):
+    fprt_elements = container.select(".fprt, .forebet_p1, .forebet_p2, .forebet_p3, [class*='prob']")
+    if fprt_elements:
+        combined_text = " ".join([el.get_text(" ", strip=True) for el in fprt_elements])
+        numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", combined_text)]
+        for i in range(len(numbers) - 2):
+            h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
+            if 90 <= (h + d + a) <= 110:
+                return h, d, a
+
+    clean_copy = BeautifulSoup(str(container), "html.parser")
+    for tag_name in [
+        ".homeTeam", ".awayTeam", "[class*='homeTeam']", "[class*='awayTeam']",
+        ".forebet_odds", "[class*='odds']", ".l_score", "[class*='score']",
+        ".st-time", "[class*='time']", ".date", "[class*='date']", "a"
+    ]:
+        for tag in clean_copy.select(tag_name):
+            tag.decompose()
+
+    numbers = [int(n) for n in re.findall(r"\b\d{1,3}\b", clean_copy.get_text(" ", strip=True))]
+    for i in range(len(numbers) - 2):
+        h, d, a = numbers[i], numbers[i + 1], numbers[i + 2]
+        if 90 <= (h + d + a) <= 110:
+            return h, d, a
+
+    return None
+
+
+def extract_match_meta(container):
+    flag_code = ""
+    img_el = container.select_one("img.flsc")
+    if img_el and img_el.get("src"):
+        match = re.search(r"/fc/([a-zA-Z0-9_-]+)\.png", img_el["src"])
+        if match:
+            flag_code = match.group(1)
+
+    tag_el = container.select_one(".shortTag")
+    league_tag = tag_el.get_text(strip=True) if tag_el else ""
+
+    date_el = container.select_one(".date_bah")
+    match_datetime = date_el.get_text(strip=True) if date_el else ""
+
+    match_url = ""
+    link_el = container.select_one("a.tnmscn")
+    if link_el and link_el.get("href"):
+        href = link_el["href"]
+        match_url = href if href.startswith("http") else f"https://www.forebet.com{href}"
+
+    return flag_code, league_tag, match_datetime, match_url
+
+
+def flag_emoji(code):
+    if not code or len(code) != 2 or not code.isalpha():
+        return ""
+    return "".join(chr(0x1F1E6 + (ord(c.upper()) - ord("A"))) for c in code)
+
+
+def get_coefficient(row):
+    odds_element = row.select_one(".lscrsp:not(.lcurodd)")
+    if not odds_element:
+        return 0.0
+
+    text = odds_element.get_text(strip=True)
+
+    if not text or text in ("-", "no"):
+        return 0.0
+
+    american_match = re.fullmatch(r"[+-]\d+", text)
+    if american_match:
+        value = int(text)
+        if value > 0:
+            return round((value / 100) + 1, 2)
+        else:
+            return round((100 / abs(value)) + 1, 2)
+
+    decimal_match = re.fullmatch(r"\d+(?:\.\d+)?", text)
+    if decimal_match:
+        return float(text)
+
+    return 0.0
+
+
+def _normalize_team_name(name):
+    """Loosens team-name comparison so minor formatting differences between
+    the listing page and a match's own detail page (extra qualifiers,
+    double spaces, etc.) don't cause a false "no match" - this is the most
+    likely cause of an H2H result being silently empty despite real data
+    existing on the page."""
+    name = name.strip().lower()
+    name = re.sub(r"\s+", " ", name)
+    return name
+
+
+def parse_h2h_letters(page_html, candidate_team_name, debug_label="", max_results=8):
     """
-    Parses Forebet Head-to-Head rows into W/L/T letters.
-    Handles missing <a> tags, score string variations, and opponent name fallbacks.
+    Parses a match detail page's "Head to head" module and returns a string
+    of W/L/T letters (most recent first) from the perspective of
+    candidate_team_name - the team our scraper actually picked (whichever
+    of home/away had the higher probability).
+
+    Name matching is intentionally loose: exact match first, then a
+    contains-either-direction fallback, since the same team can be spelled
+    very slightly differently between the listing page and its own match
+    page. debug_label is just for Action log messages so a silent empty
+    result can be traced back to its match.
+
+    Forebet only shows the most recent ~5-6 meetings directly; older ones
+    (still real data, same chronological order) sit in a ".hidd_stat"
+    wrapper that's CSS-hidden by default rather than lazy-loaded via AJAX -
+    confirmed by inspecting a real saved page, where those extra rows were
+    already present in the static HTML. So selecting .st_row anywhere in
+    the module (not just direct children of .st_rmain) picks up all
+    available history with no extra clicking/waiting needed, up to
+    max_results entries (whatever's actually available, capped at 8).
     """
     soup = BeautifulSoup(page_html, "html.parser")
 
-    # Locate H2H container
     h2h_module = None
     for module in soup.select(".moduletable"):
         title_el = module.select_one(".mptlt")
@@ -68,156 +304,594 @@ def parse_h2h_letters(
             break
 
     if not h2h_module:
+        print(f"  H2H debug [{debug_label}]: no 'Head to head' module found on page at all.")
         return ""
 
     rmain = h2h_module.select_one(".st_rmain")
     rows = rmain.select(".st_row") if rmain else []
     if not rows:
+        print(f"  H2H debug [{debug_label}]: H2H module found but contains zero rows "
+              f"(likely these two teams have never met before - not a bug).")
         return ""
 
     candidate_norm = _normalize_team_name(candidate_team_name)
-    opponent_norm = _normalize_team_name(opponent_team_name) if opponent_team_name else ""
     letters = []
+    unmatched_examples = []
 
     for row in rows:
         if len(letters) >= max_results:
             break
 
-        # Extract text directly from wrapper elements (bypasses missing <a> tags)
-        hteam_el = row.select_one(".st_hteam")
-        ateam_el = row.select_one(".st_ateam")
+        hteam_el = row.select_one(".st_hteam a")
+        ateam_el = row.select_one(".st_ateam a")
         score_el = row.select_one(".st_rescnt .st_res")
-
         if not hteam_el or not ateam_el or not score_el:
             continue
 
         hteam = hteam_el.get_text(strip=True)
         ateam = ateam_el.get_text(strip=True)
-
-        # Match numbers safely, accounting for extra text like '(AET)'
-        score_match = re.search(r"(\d+)\s*-\s*(\d+)", score_el.get_text(strip=True))
+        score_match = re.match(r"(\d+)\s*-\s*(\d+)", score_el.get_text(strip=True))
         if not score_match:
             continue
-
         home_goals, away_goals = int(score_match.group(1)), int(score_match.group(2))
 
         hteam_norm = _normalize_team_name(hteam)
         ateam_norm = _normalize_team_name(ateam)
 
-        # Check candidate match
-        cand_is_home = candidate_norm == hteam_norm or candidate_norm in hteam_norm or hteam_norm in candidate_norm
-        cand_is_away = candidate_norm == ateam_norm or candidate_norm in ateam_norm or ateam_norm in candidate_norm
-
-        # Fallback check against opponent
-        opp_is_home = opponent_norm == hteam_norm or opponent_norm in hteam_norm or hteam_norm in opponent_norm
-        opp_is_away = opponent_norm == ateam_norm or opponent_norm in ateam_norm or ateam_norm in opponent_norm
-
-        is_home = cand_is_home or opp_is_away
-        is_away = cand_is_away or opp_is_home
+        is_home = hteam_norm == candidate_norm or candidate_norm in hteam_norm or hteam_norm in candidate_norm
+        is_away = ateam_norm == candidate_norm or candidate_norm in ateam_norm or ateam_norm in candidate_norm
 
         if is_home and not is_away:
             letters.append("W" if home_goals > away_goals else "L" if home_goals < away_goals else "T")
         elif is_away and not is_home:
             letters.append("W" if away_goals > home_goals else "L" if away_goals < home_goals else "T")
+        else:
+            if len(unmatched_examples) < 1:
+                unmatched_examples.append(f"row had '{hteam}' vs '{ateam}'")
+
+    if not letters:
+        print(f"  H2H debug [{debug_label}]: found {len(rows)} H2H row(s) but matched NONE "
+              f"against candidate name '{candidate_team_name}'. Example: "
+              f"{unmatched_examples[0] if unmatched_examples else 'n/a'} "
+              f"- likely a team-name spelling mismatch between pages.")
 
     return " ".join(letters)
 
 
-# ==========================================
-# 3. ASYNC SCRAPING ENGINE
-# ==========================================
+async def fetch_h2h_for_picks(picks):
+    if not picks:
+        return {}
 
-async def fetch_h2h_for_picks(page, picks: list) -> list:
-    """
-    Navigates through pick URLs using Playwright and attaches parsed H2H outcomes.
-    """
-    results = []
-
-    for item in picks:
-        label = f"{item['home']} vs {item['away']}"
-        h2h_url = item.get("h2h_url")
-
-        if not h2h_url:
-            item["h2h"] = ""
-            results.append(item)
-            continue
-
-        print(f"Fetching H2H data for: {label}...")
-        h2h_result = ""
-
-        for attempt in range(1, 4):
-            try:
-                await page.goto(h2h_url, wait_until="domcontentloaded", timeout=15000)
-                content = await page.content()
-
-                if "Bad gateway" in content:
-                    print(f"  [{label}] Attempt {attempt}: Forebet transient 'Bad gateway'. Retrying...")
-                    if attempt < 3:
-                        await page.wait_for_timeout(3000)
-                        continue
-
-                opponent = item["away"] if item["candidate_team"] == item["home"] else item["home"]
-                
-                h2h_result = parse_h2h_letters(
-                    content,
-                    item["candidate_team"],
-                    opponent_team_name=opponent,
-                    debug_label=label,
-                )
-
-                if h2h_result or attempt == 3:
-                    break
-
-            except Exception as e:
-                print(f"  [{label}] Attempt {attempt} encountered error: {e}", file=sys.stderr)
-                if attempt < 3:
-                    await page.wait_for_timeout(2000)
-
-        item["h2h"] = h2h_result
-        results.append(item)
-
-    return results
-
-
-# ==========================================
-# 4. ENTRYPOINT
-# ==========================================
-
-async def main():
-    # Read tokens from environment variables or define fallbacks
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
-
-    sample_picks = [
-        {
-            "home": "Al Nassr",
-            "away": "Al Hilal",
-            "candidate_team": "Al Nassr",
-            "h2h_url": "https://www.forebet.com/en/head-to-head/al-nassr-v-al-hilal",
-        }
-    ]
+    sample_url = picks[0]["match_url"]
+    cookies, user_agent = get_flaresolverr_clearance(sample_url)
+    h2h_map = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        pw_cookies = [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c["domain"],
+                "path": c.get("path", "/"),
+            }
+            for c in cookies
+        ]
+        context = await browser.new_context(user_agent=user_agent, viewport={"width": 1440, "height": 900})
+        await context.add_cookies(pw_cookies)
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = await context.new_page()
 
-        processed_picks = await fetch_h2h_for_picks(page, sample_picks)
+        for item in picks:
+            url = item.get("match_url")
+            if not url:
+                continue
+            label = f"{item['home']} vs {item['away']}"
+            print(f"Fetching H2H for: {label} ({url})")
+
+            h2h_result = ""
+            for attempt in range(1, 4):
+                try:
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+
+                    if response is not None and response.status >= 400:
+                        print(f"  H2H debug [{label}] attempt {attempt}: page returned "
+                              f"HTTP {response.status} (likely a transient Forebet server "
+                              f"error, not a code issue).")
+                        if attempt < 3:
+                            await page.wait_for_timeout(3000)
+                            continue
+
+                    try:
+                        await page.wait_for_function(
+                            "document.querySelectorAll('.st_rmain > .st_row').length > 0",
+                            timeout=8000,
+                        )
+                    except Exception:
+                        pass
+                    content = await page.content()
+
+                    if "Just a moment" in content or "cf-browser-verification" in content:
+                        print(f"  H2H debug [{label}] attempt {attempt}: hit a Cloudflare "
+                              f"interstitial instead of the real page.")
+                        if attempt < 3:
+                            await page.wait_for_timeout(2000)
+                            continue
+
+                    if "Bad gateway" in content:
+                        print(f"  H2H debug [{label}] attempt {attempt}: hit a 'Bad gateway' "
+                              f"error page (Forebet's own server, confirmed transient).")
+                        if attempt < 3:
+                            await page.wait_for_timeout(3000)
+                            continue
+
+                    h2h_result = parse_h2h_letters(content, item["candidate_team"], debug_label=label)
+                    if h2h_result or attempt == 3:
+                        break
+                    print(f"  H2H debug [{label}] attempt {attempt}: empty, retrying once...")
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    print(f"Warning: H2H fetch attempt {attempt} failed for {url}: {e}")
+                    if attempt < 3:
+                        await page.wait_for_timeout(1500)
+
+            h2h_map[url] = h2h_result
+
         await browser.close()
 
-    for pick in processed_picks:
-        msg = (
-            f"<b>Match:</b> {pick['home']} vs {pick['away']}\n"
-            f"<b>Target:</b> {pick['candidate_team']}\n"
-            f"<b>H2H:</b> {pick['h2h'] if pick['h2h'] else 'No records found'}"
+    return h2h_map
+
+
+def format_h2h_boxes(h2h_str):
+    if not h2h_str:
+        return ""
+
+    box_map = {
+        "W": "🟩W",
+        "T": "🟨T",
+        "L": "🟥L",
+    }
+
+    letters = h2h_str.split()
+    return "  ".join([box_map.get(l, l) for l in letters])
+
+
+def scrape_forebet(target_day):
+    url = TARGET_URLS.get(target_day, TARGET_URLS["today"])
+    html_content = asyncio.run(fetch_full_html(url, run_label=target_day))
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    home_elements = soup.select(".homeTeam, [class*='homeTeam']")
+    raw_detected_count = len(home_elements)
+
+    results = []
+    seen_matches = set()
+    validated_count = 0
+    skipped_no_container = 0
+
+    for home_el in home_elements:
+        curr = home_el.parent
+        row_container = None
+        probabilities = None
+
+        while curr and curr.name not in ["html", "body"]:
+            away_el = curr.select_one(".awayTeam, [class*='awayTeam']")
+            if away_el:
+                homes_in_curr = curr.select(".homeTeam, [class*='homeTeam']")
+                if len(homes_in_curr) == 1:
+                    probs = extract_probabilities_from_container(curr)
+                    if probs is not None:
+                        row_container = curr
+                        probabilities = probs
+                        break
+            curr = curr.parent
+
+        if not row_container or probabilities is None:
+            skipped_no_container += 1
+            continue
+
+        home_element = row_container.select_one(".homeTeam, [class*='homeTeam']")
+        away_element = row_container.select_one(".awayTeam, [class*='awayTeam']")
+
+        if not home_element or not away_element:
+            continue
+
+        home_team = home_element.get_text(" ", strip=True)
+        away_team = away_element.get_text(" ", strip=True)
+
+        match_key = (home_team, away_team)
+        if match_key in seen_matches:
+            continue
+
+        seen_matches.add(match_key)
+        validated_count += 1
+
+        home_prob, draw_prob, away_prob = probabilities
+
+        if home_prob < MINIMUM_PROBABILITY and away_prob < MINIMUM_PROBABILITY:
+            continue
+
+        if home_prob >= away_prob:
+            pick = "1 — Home win"
+            prob = home_prob
+            candidate_team = home_team
+        else:
+            pick = "2 — Away win"
+            prob = away_prob
+            candidate_team = away_team
+
+        flag_code, league_tag, match_datetime, match_url = extract_match_meta(row_container)
+
+        results.append(
+            {
+                "source": "Forebet",
+                "home": home_team,
+                "away": away_team,
+                "pick": pick,
+                "probability": prob,
+                "coefficient": get_coefficient(row_container),
+                "flag": flag_emoji(flag_code),
+                "league_tag": league_tag,
+                "datetime": match_datetime,
+                "match_url": match_url,
+                "candidate_team": candidate_team,
+                "h2h": "",
+            }
         )
-        print(f"\n--- Output ---\n{msg}\n")
-        
-        # Uncomment to dispatch via requests:
-        # send_telegram_sync(bot_token, chat_id, msg)
+
+    stats = {
+        "raw_detected": raw_detected_count,
+        "validated_parsed": validated_count,
+        "skipped_no_container": skipped_no_container,
+        "selected_picks": len(results),
+    }
+
+    if results:
+        h2h_map = asyncio.run(fetch_h2h_for_picks(results))
+        for item in results:
+            item["h2h"] = h2h_map.get(item["match_url"], "")
+
+    sorted_results = sorted(
+        results,
+        key=lambda item: (item["coefficient"], item["probability"]),
+        reverse=True,
+    )
+
+    return sorted_results, stats
+
+
+def scrape_forebet_over_under(target_day):
+    """
+    Scrapes Forebet's dedicated Over/Under 2.5 goals page - a SEPARATE page
+    from the main 1X2 predictions page, with different markup for the
+    probability block:
+
+        Main 1X2 page:  <div class="fprc"><span>H</span><span>D</span>
+                          <span class="fpr">A</span></div>   (3 spans)
+        This O/U page:  <div class="fprc"><span>Under%</span>
+                          <span>Over%</span></div>            (2 spans)
+
+    IMPORTANT: the "fpr" highlight class is NOT reliably tied to Over vs
+    Under - confirmed from real saved HTML for both "today" and "tomorrow":
+    Forebet moves the "fpr" class onto whichever of the two values is
+    higher/predicted (sometimes Under, sometimes Over), not onto a fixed
+    position. Position is what's fixed: span[0] is always Under%, span[1]
+    is always Over%, regardless of which one carries the "fpr" class. This
+    parser reads by position only, never by the "fpr" class, so it is not
+    affected by that swap.
+
+    Reuses the same FlareSolverr+Playwright fetch/scroll/hydrate pipeline
+    as scrape_forebet() (fetch_full_html), since this page sits behind the
+    same Cloudflare protection and uses the same span[onclick*='ltodrows']
+    "More" button mechanism to reveal additional matches.
+
+    Only returns matches with Over 2.5 probability >= OVER_UNDER_MINIMUM_PROBABILITY.
+    """
+    url = OVER_UNDER_URLS.get(target_day, OVER_UNDER_URLS["today"])
+    html_content = asyncio.run(fetch_full_html(url, run_label=f"{target_day}_ou"))
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    rows = soup.select(".rcnt")
+    raw_detected_count = len(rows)
+
+    results = []
+    seen_matches = set()
+    validated_count = 0
+    skipped_wrong_layout = 0
+
+    for row in rows:
+        home_el = row.select_one(".homeTeam")
+        away_el = row.select_one(".awayTeam")
+        if not home_el or not away_el:
+            continue
+
+        home_team = home_el.get_text(" ", strip=True)
+        away_team = away_el.get_text(" ", strip=True)
+
+        match_key = (home_team, away_team)
+        if match_key in seen_matches:
+            continue
+        seen_matches.add(match_key)
+
+        fprc = row.select_one(".fprc")
+        if not fprc:
+            continue
+        spans = fprc.select("span")
+        if len(spans) != 2:
+            # Wrong layout (3 spans = the 1X2 page, not O/U) - most likely
+            # cause is a wrong/unconfirmed URL for this target_day.
+            skipped_wrong_layout += 1
+            continue
+
+        try:
+            under_prob = int(spans[0].get_text(strip=True))
+            over_prob = int(spans[1].get_text(strip=True))
+        except ValueError:
+            continue
+
+        validated_count += 1
+
+        if over_prob < OVER_UNDER_MINIMUM_PROBABILITY:
+            continue
+
+        odds_el = row.select_one(".bigOnly.prmod .lscrsp")
+        odds_text = odds_el.get_text(strip=True) if odds_el else ""
+        coefficient = 0.0
+        if odds_text and odds_text not in ("-", "no"):
+            try:
+                coefficient = float(odds_text)
+            except ValueError:
+                coefficient = 0.0
+
+        flag_code, league_tag, match_datetime, match_url = extract_match_meta(row)
+
+        results.append(
+            {
+                "source": "Forebet O/U",
+                "home": home_team,
+                "away": away_team,
+                "pick": "Over 2.5 goals",
+                "probability": over_prob,
+                "coefficient": coefficient,
+                "flag": flag_emoji(flag_code),
+                "league_tag": league_tag,
+                "datetime": match_datetime,
+                "match_url": match_url,
+                "candidate_team": "",
+                "h2h": "",
+            }
+        )
+
+    stats = {
+        "raw_detected": raw_detected_count,
+        "validated_parsed": validated_count,
+        "skipped_wrong_layout": skipped_wrong_layout,
+        "selected_picks": len(results),
+    }
+
+    sorted_results = sorted(results, key=lambda item: item["probability"], reverse=True)
+    return sorted_results, stats
+
+
+def probability_emoji(prob):
+    if prob >= 90:
+        return "🟢"
+    if prob >= 80:
+        return "🟡"
+    return "🟠"
+
+
+def send_telegram_message(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables.")
+
+    telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    blocks = message.split("\n\n")
+    chunks = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > 3900:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        response = requests.post(
+            telegram_url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    target_day = sys.argv[1].lower() if len(sys.argv) > 1 else "today"
+    if target_day not in TARGET_URLS:
+        target_day = "today"
+
+    # --- Forebet ---
+    forebet_picks, stats = scrape_forebet(target_day)
+
+    # --- GoodSport ---
+    goodsport = GoodSportScraper(min_probability=GOODSPORT_MINIMUM_PROBABILITY)
+    goodsport_picks, goodsport_stats = goodsport.scrape(target_day)
+    print(f"GoodSport picks found: {len(goodsport_picks)}")
+    print(f"GoodSport stats: {goodsport_stats}")
+
+    # --- Forebet Over/Under 2.5 ---
+    over_under_picks, ou_stats = scrape_forebet_over_under(target_day)
+    print(f"Over/Under 2.5 picks found: {len(over_under_picks)}")
+    print(f"Over/Under stats: {ou_stats}")
+
+    # --- Match the same fixture across both sources ---
+    # A match is considered "the same" if its home+away team names match
+    # after normalization (reusing the same loose name-matching used for
+    # H2H, since team spelling can differ slightly source to source).
+    # Matched fixtures become ONE merged entry (built from the Forebet
+    # pick - keeps coefficient + H2H - with GoodSport's probability
+    # attached) and are removed from both single-source lists below, so
+    # nothing appears twice across the three sections.
+    def fixture_key(item):
+        return frozenset({_normalize_team_name(item["home"]), _normalize_team_name(item["away"])})
+
+    goodsport_by_fixture = {}
+    for gs_item in goodsport_picks:
+        goodsport_by_fixture[fixture_key(gs_item)] = gs_item
+
+    merged_picks = []
+    forebet_only = []
+    matched_goodsport_keys = set()
+
+    for fb_item in forebet_picks:
+        key = fixture_key(fb_item)
+        gs_match = goodsport_by_fixture.get(key)
+        if gs_match:
+            merged_item = dict(fb_item)  # keeps coefficient, h2h, candidate_team, etc.
+            merged_item["source"] = "Forebet + GoodSport"
+            merged_item["goodsport_probability"] = gs_match["probability"]
+            merged_item["goodsport_pick"] = gs_match["pick"]
+            merged_picks.append(merged_item)
+            matched_goodsport_keys.add(key)
+        else:
+            forebet_only.append(fb_item)
+
+    goodsport_only = [
+        gs_item for gs_item in goodsport_picks
+        if fixture_key(gs_item) not in matched_goodsport_keys
+    ]
+
+    merged_picks.sort(key=lambda item: (item["coefficient"], item["probability"]), reverse=True)
+    forebet_only.sort(key=lambda item: (item["coefficient"], item["probability"]), reverse=True)
+    goodsport_only.sort(key=lambda item: item["probability"], reverse=True)
+
+    def format_pick_lines(item):
+        """
+        Builds the block of lines for a single pick. Shows which source(s)
+        the pick came from, and ALWAYS renders the H2H block whenever
+        item["h2h"] is present - merged items carry this over from their
+        Forebet half, since scrape_forebet() already populated it before
+        this script ever touches the list; nothing here strips it.
+        """
+        block = []
+
+        coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
+        dot = probability_emoji(item["probability"])
+        home = html.escape(item["home"])
+        away = html.escape(item["away"])
+        pick_text = html.escape(item["pick"])
+        source_tag = html.escape(item.get("source", "Unknown"))
+
+        meta_parts = [b for b in [item.get("flag", ""), html.escape(item.get("league_tag", "")), html.escape(item.get("datetime", ""))] if b]
+        meta_str = " • ".join(meta_parts)
+
+        if meta_str:
+            block.append(f"{dot} {meta_str}")
+        else:
+            block.append(f"{dot}")
+
+        block.append(f"<b>{home} vs {away}</b>  <i>[{source_tag}]</i>")
+
+        if "goodsport_probability" in item:
+            block.append(
+                f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | "
+                f"<code>📈 Coef: {coef_str}</code> | "
+                f"GoodSport: <b>{item['goodsport_probability']}%</b> ({html.escape(item['goodsport_pick'])})"
+            )
+        else:
+            block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | <code>📈 Coef: {coef_str}</code>")
+
+        if item.get("h2h"):
+            candidate = html.escape(item["candidate_team"])
+            h2h_formatted = format_h2h_boxes(item["h2h"])
+            block.append(f"📊 H2H ({candidate}):")
+            block.append(f"{h2h_formatted}\n")
+        else:
+            block.append("")
+
+        return block
+
+    lines = [
+        f"⚽ <b>Football picks for {target_day.upper()}</b>",
+        f"<i>Forebet: ≥{MINIMUM_PROBABILITY}% | GoodSport: ≥{GOODSPORT_MINIMUM_PROBABILITY}%</i>\n",
+    ]
+
+    # --- Section 1: Merged (same fixture confirmed by both sources) ---
+    lines.append("<blockquote>━━━━━ 🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━━━━━</blockquote>\n")
+    if merged_picks:
+        for item in merged_picks:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No matches were found by both sources.\n")
+
+    # --- Section 2: Forebet only (not also found by GoodSport) ---
+    lines.append("<blockquote>━━━━━ 🅵 <b>FOREBET ONLY</b> ━━━━━</blockquote>\n")
+    if forebet_only:
+        for item in forebet_only:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No additional Forebet-only matches.\n")
+
+    # --- Section 3: GoodSport only (not also found by Forebet) ---
+    lines.append("<blockquote>━━━━━ 🅶 <b>GOODSPORT ONLY</b> ━━━━━</blockquote>\n")
+    if goodsport_only:
+        for item in goodsport_only:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No additional GoodSport-only matches.\n")
+
+    # --- Section 4: Over/Under 2.5 goals ---
+    lines.append(f"<blockquote>━━━━━ 🥅 <b>OVER 2.5 GOALS ≥{OVER_UNDER_MINIMUM_PROBABILITY}%</b> ━━━━━</blockquote>\n")
+    if over_under_picks:
+        for item in over_under_picks:
+            lines.extend(format_pick_lines(item))
+    else:
+        lines.append("No Over 2.5 matches found matching criteria.\n")
+
+    lines.append("<blockquote>━━━━━ 📊 <b>VALIDATION DIAGNOSTICS</b> ━━━━━</blockquote>\n")
+    lines.append(f"• Forebet match nodes detected in DOM: {stats['raw_detected']}")
+    lines.append(f"• Forebet validated match rows parsed: {stats['validated_parsed']}")
+    lines.append(f"• Forebet rows skipped (no valid container): {stats['skipped_no_container']}")
+    lines.append(f"• Forebet picks meeting criteria (≥{MINIMUM_PROBABILITY}%): {stats['selected_picks']}")
+    lines.append(f"• GoodSport pages fetched: {goodsport_stats['pages_fetched']} "
+                 f"(site reports {goodsport_stats['pages_reported_by_site']} total)")
+    lines.append(f"• GoodSport raw match cards detected: {goodsport_stats['raw_cards_detected']}")
+    lines.append(f"• GoodSport validated match rows parsed: {goodsport_stats['validated_parsed']}")
+    lines.append(f"• GoodSport rows skipped (no valid data): {goodsport_stats['skipped_no_data']}")
+    lines.append(f"• GoodSport picks meeting criteria (≥{GOODSPORT_MINIMUM_PROBABILITY}%): {goodsport_stats['selected_picks']}")
+    lines.append(f"• Matches confirmed by both sources: {len(merged_picks)}")
+    lines.append(f"• Over/Under 2.5 rows detected: {ou_stats['raw_detected']}")
+    lines.append(f"• Over/Under 2.5 rows validated: {ou_stats['validated_parsed']}")
+    lines.append(f"• Over/Under 2.5 rows skipped (wrong page layout): {ou_stats['skipped_wrong_layout']}")
+    lines.append(f"• Over/Under 2.5 picks meeting criteria (≥{OVER_UNDER_MINIMUM_PROBABILITY}%): {ou_stats['selected_picks']}")
+    if ou_stats['skipped_wrong_layout'] > 0:
+        lines.append(f"⚠️ <b>Over/Under page returned the wrong layout ({ou_stats['skipped_wrong_layout']} rows) - "
+                      f"the '{target_day}' O/U URL is likely wrong. Check OVER_UNDER_URLS.</b>")
+    if goodsport_stats['pages_fetched'] < goodsport_stats['pages_reported_by_site']:
+        lines.append(f"⚠️ <b>GoodSport pagination likely broken - only page 1 was retrieved. "
+                      f"See Action logs for details.</b>")
+
+    message = "\n".join(lines)
+    send_telegram_message(message)
+    print("Telegram notification dispatched successfully.")
+    print(f"Debug artifacts (screenshots, final HTML, step-by-step counts) saved to ./{DEBUG_DIR}/")
