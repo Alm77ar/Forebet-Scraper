@@ -207,6 +207,22 @@ def extract_probabilities_from_container(container):
     return None
 
 
+def reformat_date_to_ddmmyyyy(text):
+    """
+    Forebet's .date_bah text comes as "MM/DD/YYYY hh:mm AM/PM" (confirmed:
+    the Dinamo Zagreb vs HNK Gorica match, saved on a page titled "05 Sep
+    2026", showed its own date as "09/05/2026" - i.e. month=09/Sep,
+    day=05, American-style MM/DD). Converts just the date portion to
+    dd/MM/yyyy, leaving the time part untouched. If the text doesn't match
+    the expected pattern, returns it unchanged rather than mangling it.
+    """
+    match = re.match(r"^(\d{2})/(\d{2})/(\d{4})(.*)$", text.strip())
+    if not match:
+        return text
+    mm, dd, yyyy, rest = match.groups()
+    return f"{dd}/{mm}/{yyyy}{rest}"
+
+
 def extract_match_meta(container):
     flag_code = ""
     img_el = container.select_one("img.flsc")
@@ -220,6 +236,7 @@ def extract_match_meta(container):
 
     date_el = container.select_one(".date_bah")
     match_datetime = date_el.get_text(strip=True) if date_el else ""
+    match_datetime = reformat_date_to_ddmmyyyy(match_datetime)
 
     match_url = ""
     link_el = container.select_one("a.tnmscn")
@@ -415,10 +432,24 @@ async def fetch_h2h_for_picks(picks):
                     try:
                         await page.wait_for_function(
                             "document.querySelectorAll('.st_rmain > .st_row').length > 0",
-                            timeout=8000,
+                            timeout=15000,
                         )
                     except Exception:
-                        pass
+                        # IMPORTANT: this used to be silently swallowed as
+                        # "legitimate first-ever meeting" - but testing
+                        # against a real saved match page (Al Nassr vs Abha
+                        # Club) showed the H2H module and its rows WERE
+                        # present in the static HTML and parsed correctly
+                        # offline, meaning live runs were very likely just
+                        # timing out before the module finished hydrating
+                        # (previously only an 8s wait - raised to 15s above)
+                        # rather than genuinely having no data. Logging this
+                        # explicitly so future empty results can be told
+                        # apart from real first-ever-meeting cases in the
+                        # Action logs instead of looking identical.
+                        print(f"  H2H debug [{label}] attempt {attempt}: wait for H2H rows "
+                              f"timed out after 15s - page may not have fully hydrated. "
+                              f"Proceeding to parse whatever loaded so far.")
                     content = await page.content()
 
                     if "Just a moment" in content or "cf-browser-verification" in content:
