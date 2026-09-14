@@ -209,18 +209,35 @@ def extract_probabilities_from_container(container):
 
 def reformat_date_to_ddmmyyyy(text):
     """
-    Forebet's .date_bah text comes as "MM/DD/YYYY hh:mm AM/PM" (confirmed:
+    Forebet's .date_bah text comes as "MM/DD/YYYY h:mm AM/PM" (confirmed:
     the Dinamo Zagreb vs HNK Gorica match, saved on a page titled "05 Sep
     2026", showed its own date as "09/05/2026" - i.e. month=09/Sep,
-    day=05, American-style MM/DD). Converts just the date portion to
-    dd/MM/yyyy, leaving the time part untouched. If the text doesn't match
-    the expected pattern, returns it unchanged rather than mangling it.
+    day=05, American-style MM/DD).
+
+    Converts to "dd/MM/yyyy    HH:mm" - date swapped to day-first, time
+    converted from 12h AM/PM to zero-padded 24h (e.g. "4:00 PM" -> "16:00",
+    "1:00 AM" -> "01:00"), with 4 literal spaces between date and time.
+
+    If the text doesn't match the expected pattern, returns it unchanged
+    rather than mangling it.
     """
-    match = re.match(r"^(\d{2})/(\d{2})/(\d{4})(.*)$", text.strip())
+    match = re.match(
+        r"^(\d{2})/(\d{2})/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)$",
+        text.strip(),
+        re.IGNORECASE,
+    )
     if not match:
         return text
-    mm, dd, yyyy, rest = match.groups()
-    return f"{dd}/{mm}/{yyyy}{rest}"
+
+    mm, dd, yyyy, hour, minute, ampm = match.groups()
+    hour = int(hour)
+    ampm = ampm.upper()
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+
+    return f"{dd}/{mm}/{yyyy}    {hour:02d}:{minute}"
 
 
 def extract_match_meta(container):
@@ -826,7 +843,8 @@ if __name__ == "__main__":
         """
         block = []
 
-        coef_str = f"{item['coefficient']:.2f}" if item["coefficient"] > 0 else "N/A"
+        has_coef = item["coefficient"] > 0
+        coef_str = f"{item['coefficient']:.2f}" if has_coef else ""
         dot = probability_emoji(item["probability"])
         home = html.escape(item["home"])
         away = html.escape(item["away"])
@@ -843,14 +861,18 @@ if __name__ == "__main__":
 
         block.append(f"<b>{home} vs {away}</b>  <i>[{source_tag}]</i>")
 
+        # Coef segment is only included when a real coefficient exists -
+        # no more "Coef: N/A" clutter when Forebet doesn't expose odds
+        # for a match.
+        coef_segment = f" | <code>📈 Coef: {coef_str}</code>" if has_coef else ""
+
         if "goodsport_probability" in item:
             block.append(
-                f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | "
-                f"<code>📈 Coef: {coef_str}</code> | "
+                f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%){coef_segment} | "
                 f"GoodSport: <b>{item['goodsport_probability']}%</b> ({html.escape(item['goodsport_pick'])})"
             )
         else:
-            block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%) | <code>📈 Coef: {coef_str}</code>")
+            block.append(f"🎯 Pick: <b>{pick_text}</b> ({item['probability']}%){coef_segment}")
 
         if item.get("h2h"):
             candidate = html.escape(item["candidate_team"])
@@ -868,7 +890,7 @@ if __name__ == "__main__":
     ]
 
     # --- Section 1: Merged (same fixture confirmed by both sources) ---
-    lines.append("<blockquote>━━━━━ 🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━━━━━</blockquote>\n")
+    lines.append("<blockquote>━🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━</blockquote>\n")
     if merged_picks:
         for item in merged_picks:
             lines.extend(format_pick_lines(item))
@@ -899,7 +921,7 @@ if __name__ == "__main__":
     else:
         lines.append("No Over 2.5 matches found matching criteria.\n")
 
-    lines.append("<blockquote>━━━━━ 📊 <b>VALIDATION DIAGNOSTICS</b> ━━━━━</blockquote>\n")
+    lines.append("<blockquote>━ 📊 <b>VALIDATION DIAGNOSTICS</b> ━</blockquote>\n")
     lines.append(f"• Forebet match nodes detected in DOM: {stats['raw_detected']}")
     lines.append(f"• Forebet validated match rows parsed: {stats['validated_parsed']}")
     lines.append(f"• Forebet rows skipped (no valid container): {stats['skipped_no_container']}")
