@@ -890,7 +890,7 @@ if __name__ == "__main__":
     ]
 
     # --- Section 1: Merged (same fixture confirmed by both sources) ---
-    lines.append("<blockquote>━🔀 <b>MERGED — CONFIRMED BY BOTH SOURCES</b> ━</blockquote>\n")
+    lines.append("<blockquote>━🔀 <b>CONFIRMED BY BOTH SOURCES</b> ━</blockquote>\n")
     if merged_picks:
         for item in merged_picks:
             lines.extend(format_pick_lines(item))
