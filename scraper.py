@@ -237,7 +237,7 @@ def reformat_date_to_ddmmyyyy(text):
     elif ampm == "AM" and hour == 12:
         hour = 0
 
-    return f"{dd}/{mm}/{yyyy}    {hour:02d}:{minute}"
+    return f"{dd}/{mm}/{yyyy}        {hour:02d}:{minute}"
 
 
 def extract_match_meta(container):
